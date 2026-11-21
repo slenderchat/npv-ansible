@@ -1,0 +1,9 @@
+---
+# Additional /etc/hosts records rendered after the standard entries, in order.
+# Each record is an address and an ordered list of names, for example:
+#   hosts_extra_records:
+#     - address: 192.0.2.10
+#       names:
+#         - example-01.example.org
+#         - example-01
+hosts_extra_records: []

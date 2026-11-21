@@ -10,6 +10,7 @@ This repository currently contains:
 
 - the static inventory: [`inventory/hosts.yml`](inventory/hosts.yml);
 - the `timezone` role: [`roles/timezone`](roles/timezone);
+- the `hosts` role: [`roles/hosts`](roles/hosts);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -46,6 +47,38 @@ Documented module behavior:
 - if the host already uses `Europe/Moscow`, the task reports no change, including with `--check`;
 - with `--check`, a different timezone is reported as a change, and nothing is changed on the host;
 - with `--diff`, alone or combined with `--check`, the module shows its own before/after values of `name`.
+
+### `hosts`
+
+Renders the complete `/etc/hosts` from a template (owner `root:root`, mode `0644`) and keeps it immutable (`chattr +i`) between runs. Any lines added outside the template, for example by the provider, are removed. The system hostname, DNS resolver configuration and cloud-init settings are not managed by this role.
+
+Managed entries:
+
+- `127.0.0.1 localhost`;
+- `127.0.1.1 <short-name> <fqdn>`, where `<fqdn>` is `inventory_hostname` and `<short-name>` is its first label; the current system hostname, network facts and DNS are not used;
+- the standard Debian IPv6 entries: `::1 localhost ip6-localhost ip6-loopback`, `ff02::1 ip6-allnodes`, `ff02::2 ip6-allrouters`;
+- optional records from `hosts_extra_records` (default `[]`), rendered after the standard entries in the given order:
+
+  ```yaml
+  hosts_extra_records:
+    - address: 192.0.2.10
+      names:
+        - example-01.example.org
+        - example-01
+  ```
+
+Behavior:
+
+- `/etc/hosts` must be absent or a regular file; any other type, such as a symlink, fails the role before any change. For an existing file the role reads the flags with `lsattr` on every run, including on a converged host; a converged run reports no change and performs no rewrite or `chattr` operation.
+- When an update is needed, the role temporarily clears `i` if it is set. Content changes use atomic replacement; owner, group and mode are corrected without replacing the file. If only `i` is missing, it is set without rewriting the file.
+- After setting `i`, the role reads the flags back and fails if `i` is missing. If an update fails after `i` was cleared, the role attempts to restore `i` and reports the original error together with the verification result.
+
+Requires `lsattr` and `chattr` (package `e2fsprogs`) and a filesystem that supports the immutable attribute on the managed host. While `i` is set, ordinary writes to `/etc/hosts`, including by cloud-init or provider agents, are blocked.
+
+Check and diff:
+
+- with `--check`, the role inspects the current state and predicts changes without modifying `/etc/hosts` or its attributes;
+- with `--diff`, content drift produces one before/after content diff; an attribute-only change has no content diff.
 
 ## Planned playbooks
 
