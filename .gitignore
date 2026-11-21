@@ -1,0 +1,11 @@
+# Ansible local state
+.ansible/
+*.retry
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local Ansible Vault password file
+/.vault-password
