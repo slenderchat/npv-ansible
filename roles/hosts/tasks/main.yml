@@ -1,0 +1,123 @@
+---
+- name: Inspect /etc/hosts
+  ansible.builtin.stat:
+    path: /etc/hosts
+    follow: false
+    get_attributes: false
+    get_checksum: false
+  register: hosts_stat
+
+- name: Ensure /etc/hosts is absent or a regular file
+  ansible.builtin.assert:
+    that:
+      - hosts_stat.stat.isreg
+    fail_msg: /etc/hosts must be a regular file, not a symlink or other type.
+    quiet: true
+  when: hosts_stat.stat.exists
+
+# lsattr is read-only, so it also runs in check mode. Its output is
+# "<flags> /etc/hosts"; flags are letters or "-" for inactive flags.
+- name: Read /etc/hosts attribute flags
+  ansible.builtin.command: lsattr -d /etc/hosts
+  check_mode: false
+  changed_when: false
+  failed_when: >-
+    hosts_lsattr.rc | default(1) != 0
+    or hosts_lsattr.stdout is not match('^[A-Za-z-]+[ ]+/etc/hosts$')
+  register: hosts_lsattr
+  when: hosts_stat.stat.exists
+
+- name: Record whether /etc/hosts is currently immutable
+  ansible.builtin.set_fact:
+    hosts_was_immutable: >-
+      {{ hosts_stat.stat.exists and 'i' in hosts_lsattr.stdout.split()[0] }}
+
+- name: Compare /etc/hosts with the template
+  ansible.builtin.template:
+    src: hosts.j2
+    dest: /etc/hosts
+    owner: root
+    group: root
+    mode: "0644"
+  check_mode: true
+  register: hosts_compare
+
+- name: Record whether /etc/hosts needs the immutable attribute set
+  ansible.builtin.set_fact:
+    hosts_needs_lock: >-
+      {{ not hosts_was_immutable or hosts_compare is changed }}
+
+- name: Update /etc/hosts
+  when: hosts_compare is changed and not ansible_check_mode
+  block:
+    - name: Remove the immutable attribute from /etc/hosts before the update
+      ansible.builtin.command: chattr -i /etc/hosts
+      changed_when: true
+      when: hosts_was_immutable
+
+    - name: Render /etc/hosts
+      ansible.builtin.template:
+        src: hosts.j2
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: "0644"
+      diff: false
+
+  rescue:
+    - name: Keep the original /etc/hosts update error
+      ansible.builtin.set_fact:
+        hosts_update_error: >-
+          {{ ansible_failed_result.msg | default('unknown error') }}
+
+    # Failures of the next two tasks are shown and summarized by the last one.
+    - name: Restore the immutable attribute on /etc/hosts after a failed update
+      ansible.builtin.command: chattr +i /etc/hosts
+      changed_when: true
+      ignore_errors: true  # noqa: ignore-errors
+      when: hosts_was_immutable
+
+    - name: Verify the restored immutable attribute on /etc/hosts
+      ansible.builtin.command: lsattr -d /etc/hosts
+      changed_when: false
+      failed_when: >-
+        hosts_restore_lsattr.rc | default(1) != 0
+        or hosts_restore_lsattr.stdout
+        is not match('^[A-Za-z-]*i[A-Za-z-]*[ ]+/etc/hosts$')
+      ignore_errors: true  # noqa: ignore-errors
+      register: hosts_restore_lsattr
+      when: hosts_was_immutable
+
+    - name: Report the failed /etc/hosts update
+      ansible.builtin.fail:
+        msg: >-
+          Updating /etc/hosts failed: {{ hosts_update_error }}
+          {% if not hosts_was_immutable %}
+          (the file was not immutable before the update).
+          {% elif hosts_restore_lsattr is succeeded %}
+          (the immutable attribute is present).
+          {% else %}
+          (restoring the immutable attribute FAILED; /etc/hosts may be
+          left without +i).
+          {% endif %}
+
+- name: Set the immutable attribute on /etc/hosts
+  ansible.builtin.command: chattr +i /etc/hosts
+  changed_when: true
+  when: hosts_needs_lock and not ansible_check_mode
+
+- name: Report that /etc/hosts would be made immutable
+  ansible.builtin.debug:
+    msg: The immutable attribute would be set on /etc/hosts.
+  changed_when: true
+  when: hosts_needs_lock and ansible_check_mode
+
+- name: Verify that /etc/hosts is immutable
+  ansible.builtin.command: lsattr -d /etc/hosts
+  changed_when: false
+  failed_when: >-
+    hosts_locked_lsattr.rc | default(1) != 0
+    or hosts_locked_lsattr.stdout
+    is not match('^[A-Za-z-]*i[A-Za-z-]*[ ]+/etc/hosts$')
+  register: hosts_locked_lsattr
+  when: hosts_needs_lock and not ansible_check_mode
