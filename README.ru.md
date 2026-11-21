@@ -6,7 +6,11 @@
 
 ## Текущее состояние
 
-Сейчас репозиторий содержит только статический инвентарь: [`inventory/hosts.yml`](inventory/hosts.yml).
+Сейчас репозиторий содержит:
+
+- статический инвентарь: [`inventory/hosts.yml`](inventory/hosts.yml);
+- роль `timezone`: [`roles/timezone`](roles/timezone);
+- требования к коллекциям: [`collections/requirements.yml`](collections/requirements.yml).
 
 Группы хостов:
 
@@ -20,6 +24,28 @@
 ```sh
 ansible-inventory -i inventory/hosts.yml --graph
 ```
+
+## Коллекции
+
+Установите нужные коллекции на управляющей машине:
+
+```sh
+ansible-galaxy collection install -r collections/requirements.yml
+```
+
+## Роли
+
+### `timezone`
+
+Устанавливает на управляемом хосте системный часовой пояс `Europe/Moscow` с помощью `community.general.timezone` только с параметром `name`. Аппаратные часы и NTP эта роль не настраивает.
+
+На хостах с systemd модуль читает и задаёт часовой пояс через `timedatectl`, поэтому на управляемом хосте нужны работающий `timedatectl` и файл зоны `/usr/share/zoneinfo/Europe/Moscow` из пакета `tzdata`. `hwclock` (пакет `util-linux-extra`) нужен, только если модуль переходит на путь без systemd, потому что `timedatectl` отсутствует или не работает.
+
+Документированное поведение модуля:
+
+- если на хосте уже задан `Europe/Moscow`, задача не сообщает об изменениях, в том числе с `--check`;
+- с `--check` другой часовой пояс отображается как изменение, а на хосте ничего не меняется;
+- с `--diff`, отдельно или вместе с `--check`, модуль показывает собственные значения `name` до и после.
 
 ## Планируемые плейбуки
 
