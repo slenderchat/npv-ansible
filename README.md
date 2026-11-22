@@ -11,6 +11,7 @@ This repository currently contains:
 - the static inventory: [`inventory/hosts.yml`](inventory/hosts.yml);
 - the `timezone` role: [`roles/timezone`](roles/timezone);
 - the `hosts` role: [`roles/hosts`](roles/hosts);
+- the `hostname` role: [`roles/hostname`](roles/hostname);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -79,6 +80,14 @@ Check and diff:
 
 - with `--check`, the role inspects the current state and predicts changes without modifying `/etc/hosts` or its attributes;
 - with `--diff`, content drift produces one before/after content diff; an attribute-only change has no content diff.
+
+### `hostname`
+
+Sets the system hostname with `ansible.builtin.hostname` and the `systemd` strategy, which uses `hostnamectl` to set the static and transient hostname.
+
+The hostname is the first label of the inventory FQDN, `inventory_hostname_short`; for example, `ingress-ru-tweb-msk1-01.sl-chat.ru` gets the hostname `ingress-ru-tweb-msk1-01`. `/etc/hosts` is managed by the `hosts` role, not by this role.
+
+Check mode and diff mode are supported natively by the module: with `--check` a different hostname is reported as a change without modifying the host, and with `--diff` the module shows the hostname before and after.
 
 ## Planned playbooks
 

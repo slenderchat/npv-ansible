@@ -11,6 +11,7 @@
 - статический инвентарь: [`inventory/hosts.yml`](inventory/hosts.yml);
 - роль `timezone`: [`roles/timezone`](roles/timezone);
 - роль `hosts`: [`roles/hosts`](roles/hosts);
+- роль `hostname`: [`roles/hostname`](roles/hostname);
 - требования к коллекциям: [`collections/requirements.yml`](collections/requirements.yml).
 
 Группы хостов:
@@ -79,6 +80,14 @@ ansible-galaxy collection install -r collections/requirements.yml
 
 - с `--check` роль проверяет текущее состояние и прогнозирует изменения, не изменяя `/etc/hosts` и его атрибуты;
 - с `--diff` расхождение содержимого даёт один diff содержимого до и после; изменение только атрибута не даёт diff содержимого.
+
+### `hostname`
+
+Задаёт системное имя хоста с помощью `ansible.builtin.hostname` со стратегией `systemd`, которая через `hostnamectl` устанавливает статическое и временное (transient) имя хоста.
+
+Имя хоста — это первая метка FQDN из инвентаря, `inventory_hostname_short`; например, `ingress-ru-tweb-msk1-01.sl-chat.ru` получает имя `ingress-ru-tweb-msk1-01`. Файлом `/etc/hosts` управляет роль `hosts`, а не эта роль.
+
+Режимы проверки и diff поддерживаются модулем нативно: с `--check` другое имя хоста отображается как изменение без изменения хоста, а с `--diff` модуль показывает имя хоста до и после.
 
 ## Планируемые плейбуки
 
