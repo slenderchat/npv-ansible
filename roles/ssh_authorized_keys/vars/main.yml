@@ -1,0 +1,70 @@
+---
+ssh_authorized_keys_dir: /root/.ssh
+ssh_authorized_keys_path: /root/.ssh/authorized_keys
+
+# One plain public key line: a supported type, the base64 key blob and an
+# optional comment. Options, certificates, private keys and multi-line values
+# do not match.
+ssh_authorized_keys_line_re: "^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)\
+  |sk-ssh-ed25519@openssh\\.com|sk-ecdsa-sha2-nistp256@openssh\\.com)\
+  [ \\t]+AAAA[A-Za-z0-9+/]+={0,2}([ \\t][^\\r\\n]*)?\\Z"
+
+# A line of the current file that sshd reads as a key without options; any
+# other non-comment line is treated as an entry with options.
+ssh_authorized_keys_plain_re: '^[a-z0-9@.-]+[ \t]+AAAA[A-Za-z0-9+/]+=*([ \t]|\Z)'
+ssh_authorized_keys_skip_re: '(#|\Z)'
+
+# The key identity is the type and the key blob, without the comment.
+ssh_authorized_keys_material_re: '^(\S+)\s+(\S+).*\Z'
+ssh_authorized_keys_material_repl: '\1 \2'
+
+ssh_authorized_keys_probe_marker: npv-ssh-authorized-keys-proof
+
+# Derived values, templated lazily after validation. They hold key material,
+# so they are never printed.
+ssh_authorized_keys_materials: >-
+  {{ ssh_authorized_keys_list
+     | map('regex_replace', ssh_authorized_keys_material_re,
+           ssh_authorized_keys_material_repl) | list }}
+ssh_authorized_keys_desired: "{{ ssh_authorized_keys_list | join('\n') ~ '\n' }}"
+ssh_authorized_keys_current_text: >-
+  {{ ssh_authorized_keys_current.content | b64decode
+     if ssh_authorized_keys_current is not skipped else '' }}
+ssh_authorized_keys_current_entries: >-
+  {{ ssh_authorized_keys_current_text.splitlines() | map('trim')
+     | reject('match', ssh_authorized_keys_skip_re) | list }}
+ssh_authorized_keys_current_plain: >-
+  {{ ssh_authorized_keys_current_entries
+     | select('match', ssh_authorized_keys_plain_re)
+     | map('regex_replace', ssh_authorized_keys_material_re,
+           ssh_authorized_keys_material_repl)
+     | unique(case_sensitive=true) | list }}
+ssh_authorized_keys_current_options: >-
+  {{ ssh_authorized_keys_current_entries
+     | reject('match', ssh_authorized_keys_plain_re) | list }}
+
+ssh_authorized_keys_added: >-
+  {{ ssh_authorized_keys_materials
+     | difference(ssh_authorized_keys_current_plain) | length }}
+ssh_authorized_keys_removed: >-
+  {{ ssh_authorized_keys_current_plain
+     | difference(ssh_authorized_keys_materials) | length }}
+ssh_authorized_keys_content_changed: >-
+  {{ not ssh_authorized_keys_file_stat.stat.exists
+     or ssh_authorized_keys_current_text != ssh_authorized_keys_desired }}
+# Removing a key or replacing an entry with options needs a login proof;
+# additions and comment, order or duplicate changes do not.
+ssh_authorized_keys_proof_needed: >-
+  {{ ssh_authorized_keys_removed | int > 0
+     or ssh_authorized_keys_current_options | length > 0 }}
+
+ssh_authorized_keys_proof_file: "{{ ssh_authorized_keys_proof_identity | expanduser }}"
+ssh_authorized_keys_proof_line: "{{ lookup('ansible.builtin.file', ssh_authorized_keys_proof_file) }}"
+ssh_authorized_keys_proof_material: >-
+  {{ ssh_authorized_keys_proof_line
+     | regex_replace(ssh_authorized_keys_material_re,
+                     ssh_authorized_keys_material_repl) }}
+# The approved line for the proof key, as it appears in the final file.
+ssh_authorized_keys_proof_entry: >-
+  {{ ssh_authorized_keys_list[
+       ssh_authorized_keys_materials.index(ssh_authorized_keys_proof_material)] }}
