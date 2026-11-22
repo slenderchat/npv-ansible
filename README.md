@@ -14,6 +14,7 @@ This repository currently contains:
 - the `hostname` role: [`roles/hostname`](roles/hostname);
 - the `dns_resolver` role: [`roles/dns_resolver`](roles/dns_resolver);
 - the `locale` role: [`roles/locale`](roles/locale);
+- the `chrony` role: [`roles/chrony`](roles/chrony);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -137,6 +138,12 @@ Check and diff:
 Sets the persistent system default locale `LANG=C.UTF-8` in `/etc/locale.conf` with a single `ansible.builtin.lineinfile` task. The file is created if it is absent and kept as `root:root 0644`. An existing active `LANG=` line, quoted or not, is replaced; `LANGUAGE`, `LC_*` and commented lines, as well as other settings and comments, are kept. Locale generation and running sessions are not managed by this role.
 
 Check mode and diff mode are supported natively by the module: with `--check` a missing or different `LANG` is reported as a change without modifying the host, and with `--diff` the module shows the file contents before and after.
+
+### `chrony`
+
+Ensures that the `chrony` package is installed and `chrony.service` is enabled and started, using `ansible.builtin.apt` and `ansible.builtin.systemd_service`. The package configuration and time sources are kept; a converged run reports no change or restart. A running daemon alone does not verify clock synchronization.
+
+With `--check` the role reads only the local APT metadata and does not refresh it: if chrony is installed or has an installation candidate there, apt simulates the installation and, with `--diff`, shows the package transaction; otherwise the installation is reported as a change whose transaction is unknown until APT metadata is available. If `chrony.service` does not exist yet, its planned activation is shown as a message; an existing unit is evaluated by the module.
 
 ## Planned playbooks
 
