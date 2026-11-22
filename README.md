@@ -15,6 +15,7 @@ This repository currently contains:
 - the `dns_resolver` role: [`roles/dns_resolver`](roles/dns_resolver);
 - the `locale` role: [`roles/locale`](roles/locale);
 - the `chrony` role: [`roles/chrony`](roles/chrony);
+- the `apt_sources` role: [`roles/apt_sources`](roles/apt_sources);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -144,6 +145,38 @@ Check mode and diff mode are supported natively by the module: with `--check` a 
 Ensures that the `chrony` package is installed and `chrony.service` is enabled and started, using `ansible.builtin.apt` and `ansible.builtin.systemd_service`. The package configuration and time sources are kept; a converged run reports no change or restart. A running daemon alone does not verify clock synchronization.
 
 With `--check` the role reads only the local APT metadata and does not refresh it: if chrony is installed or has an installation candidate there, apt simulates the installation and, with `--diff`, shows the package transaction; otherwise the installation is reported as a change whose transaction is unknown until APT metadata is available. If `chrony.service` does not exist yet, its planned activation is shown as a message; an existing unit is evaluated by the module.
+
+### `apt_sources`
+
+Manages the Debian APT sources in `/etc/apt/sources.list.d/debian.sources` (deb822, `root:root 0644`): `https://deb.debian.org/debian` for `trixie` and `trixie-updates` and `https://security.debian.org/debian-security` for `trixie-security`, with `Types: deb` and `Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp` in every stanza. The keyring and the CA bundle `/etc/ssl/certs/ca-certificates.crt` must be readable before anything changes; keys are never fetched. The role installs, upgrades or removes no packages and sets neither `APT::Default-Release` nor `deb-src` entries.
+
+Variables (defaults: `main` and no backports):
+
+- `apt_sources_components` — the complete ordered list of components, unique entries from `main`, `contrib`, `non-free` and `non-free-firmware`;
+- `apt_sources_backports_packages` — exact binary package names allowed from `trixie-backports`; an empty list disables backports.
+
+Overrides go to `inventory/group_vars/<group_name>/apt_sources.yml` or `inventory/host_vars/<inventory_hostname>/apt_sources.yml`. An illustrative host file:
+
+```yaml
+apt_sources_components:
+  - main
+  - non-free-firmware
+apt_sources_backports_packages:
+  - example-package
+```
+
+With a non-empty list the role adds a `trixie-backports` stanza and `/etc/apt/preferences.d/npv-backports.pref`, which gives the listed packages priority 100 and every other backports package priority -1, so stable stays the normal source wherever it has the package. Listing a package installs or upgrades nothing. The intended workflow is explicit selection with `apt install <package>/trixie-backports`; a dependency that needs a backported version must be listed too. This is a convention, not an APT guarantee: a listed package without a stable candidate is installed from backports by a plain `apt install`. The preferences file is written before the source is enabled and removed only after the source is disabled.
+
+Migration. Before any change the role reads `/etc/apt/sources.list`, the active `.list` and `.sources` files and the APT preferences, without contacting mirrors. It recognizes only plain `deb`/`deb-src` entries for `deb.debian.org`, `ftp.debian.org` or `ftp.<cc>.debian.org` `/debian` and `security.debian.org/debian-security` with the trixie suites above, Debian components and at most a `signed-by` of the Debian keyring. A file holding only such entries, active or disabled, is migrated: `/etc/apt/sources.list` keeps a comment, another file is removed, and official `deb-src` entries are dropped. Other repositories and preferences stay untouched. The role stops before any change, naming the file and the reason, when a file to be rewritten or removed, including an existing `debian.sources`, also holds other entries or disabled deb822 stanzas for other repositories, an official entry has another suite or extra options, backports comes from another archive, `npv-backports.pref` was not written by the role, or the pending-refresh marker is not the role's own regular file. With backports enabled, a preference record is kept only if it provably cannot match `trixie-backports`: an `origin` pin for a host other than `deb.debian.org`, or a `release` pin with a literal `n` value other than `trixie-backports` or a literal `o` or `l` value other than `Debian Backports`. A suite (`a=`) value is never taken as proof, because suite aliases move between releases. Any other record, for example a `version` pin, stops the role with its file and line; the role does not evaluate the full APT policy language. With backports disabled, other preferences are not examined. Other layouts, including provider mirrors and `mirror+file:` URIs, are not migrated automatically.
+
+Removing a component or narrowing or disabling backports is checked against the installed packages in the local APT cache (`dpkg-query`, `apt-cache policy`). For each installed package that has a version in a source being removed or losing backports eligibility, and for each installed version known only from the dpkg status, a remaining source must offer the installed version or a newer one (compared with `dpkg --compare-versions` on the host) at priority 100 or more after the change. Backports versions are evaluated with the proposed restriction; other priorities come from the current `apt-cache policy` and the existing preferences, which the role keeps. The role stops before any change with a per-package reason: unavailable (only a source being removed offers the version), prohibited (the remaining offer is below priority 100), uncertain provenance (a dpkg status version with no remaining offer; the role does not claim where it came from), or indeterminate (existing preferences or an ambiguous `apt-cache policy` record leave the result open). It also stops if the index of a source to remove is missing. These checks run only when a component is removed or backports eligibility shrinks; otherwise no indexes are needed.
+
+After a source change a normal run refreshes the indexes with `apt-get update` and `APT::Update::Error-Mode=any`, so a partial failure fails the run. `/var/lib/apt/npv-apt-sources.refresh-pending` is created before the change and removed after a successful refresh; while it exists, the next run retries the refresh. A converged run reports no change and does not refresh.
+
+Check and diff:
+
+- with `--check`, the role performs the same read-only inspection and stops on the same blockers; it lists the files to migrate, reports the removals and whether an index refresh would run, and writes nothing, refreshes nothing and contacts no mirror. A file whose directory does not exist yet is shown as a message;
+- with `--diff`, `debian.sources`, the preferences file and a reduced `/etc/apt/sources.list` show content diffs; removed files show their path state.
 
 ## Planned playbooks
 

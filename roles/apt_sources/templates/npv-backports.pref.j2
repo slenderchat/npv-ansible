@@ -1,0 +1,14 @@
+{{ apt_sources_marker }}
+# Stable stays the normal source where it has the package. The intended
+# workflow is explicit selection as <package>/trixie-backports, after which
+# the package follows backports updates. Priority 100 does not enforce that:
+# an allowlisted package without a stable candidate can be installed from
+# backports without selection. Other backports packages get priority -1.
+
+Package: {{ apt_sources_backports_packages | join(' ') }}
+Pin: release n=trixie-backports
+Pin-Priority: 100
+
+Package: *
+Pin: release n=trixie-backports
+Pin-Priority: -1

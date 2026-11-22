@@ -1,0 +1,43 @@
+---
+# Internal constants of the apt_sources role.
+
+apt_sources_supported_components:
+  - main
+  - contrib
+  - non-free
+  - non-free-firmware
+
+# An exact Debian binary package name (Debian Policy 5.6.7); \Z also rejects
+# a trailing newline.
+apt_sources_package_pattern: '^[a-z0-9][a-z0-9+.-]+\Z'
+
+apt_sources_keyring: /usr/share/keyrings/debian-archive-keyring.pgp
+# APT verifies the HTTPS archives against the system CA bundle.
+apt_sources_ca_bundle: /etc/ssl/certs/ca-certificates.crt
+
+apt_sources_sources_dir: /etc/apt/sources.list.d
+apt_sources_sources_path: /etc/apt/sources.list.d/debian.sources
+apt_sources_preferences_dir: /etc/apt/preferences.d
+apt_sources_preferences_path: /etc/apt/preferences.d/npv-backports.pref
+apt_sources_legacy_path: /etc/apt/sources.list
+
+# Present only between a source change and a successful index refresh.
+apt_sources_refresh_flag_path: /var/lib/apt/npv-apt-sources.refresh-pending
+
+# First line of every file written by the role; a preferences file without it
+# is never replaced or removed.
+apt_sources_marker: "# Managed by the apt_sources role; local edits are lost."
+
+apt_sources_backports_enabled: >-
+  {{ apt_sources_backports_packages | length > 0 }}
+
+# Rendered once per use from the same template, so the inspection and the
+# write compare identical text.
+apt_sources_sources_content: >-
+  {{ lookup('ansible.builtin.template', 'debian.sources.j2') }}
+apt_sources_preferences_content: >-
+  {{ lookup('ansible.builtin.template', 'npv-backports.pref.j2') }}
+
+apt_sources_legacy_content: |
+  {{ apt_sources_marker }}
+  # Debian sources are defined in {{ apt_sources_sources_path }}.
