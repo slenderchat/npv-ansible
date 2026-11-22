@@ -1,0 +1,62 @@
+---
+- name: Create the systemd-resolved drop-in directory
+  ansible.builtin.file:
+    path: "{{ dns_resolver_dropin_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the systemd-resolved drop-in
+  ansible.builtin.template:
+    src: resolved.conf.j2
+    dest: "{{ dns_resolver_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: dns_resolver_dropin
+
+# The unit does not exist yet in check mode on a host without the package,
+# and ansible.builtin.systemd_service fails for a missing unit even then.
+- name: Report the planned systemd-resolved activation
+  ansible.builtin.debug:
+    msg: >-
+      systemd-resolved would be installed, enabled and started with the
+      drop-in. Runtime verification happens only on a normal run.
+  changed_when: true
+  when:
+    - ansible_check_mode
+    - "'systemd-resolved' in dns_resolver_missing_packages"
+
+# Restarting also starts a stopped service, so a changed drop-in is always
+# applied before the stub is verified. An unchanged drop-in never restarts.
+- name: Restart systemd-resolved to apply the drop-in
+  ansible.builtin.systemd_service:
+    name: systemd-resolved.service
+    state: restarted
+  register: dns_resolver_restart
+  when:
+    - dns_resolver_dropin is changed
+    - not (ansible_check_mode
+           and 'systemd-resolved' in dns_resolver_missing_packages)
+
+- name: Enable and start systemd-resolved
+  ansible.builtin.systemd_service:
+    name: systemd-resolved.service
+    enabled: true
+    state: started
+  register: dns_resolver_service
+  when: >-
+    not (ansible_check_mode
+         and 'systemd-resolved' in dns_resolver_missing_packages)
+
+# A cutover or repair is in progress when anything above changed or the final
+# /etc/resolv.conf is not yet in place; only then are caches flushed.
+- name: Record whether this run performs a cutover or repair
+  ansible.builtin.set_fact:
+    dns_resolver_cutover: >-
+      {{ dns_resolver_apt is changed
+         or dns_resolver_dropin is changed
+         or dns_resolver_restart is changed
+         or dns_resolver_service is changed
+         or dns_resolver_rc_needs_lock }}

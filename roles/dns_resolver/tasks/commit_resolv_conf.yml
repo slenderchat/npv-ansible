@@ -1,0 +1,85 @@
+---
+# Runs only after the policy and the stub were verified. Failures here are
+# handled by rollback.yml, which restores the original file or symlink.
+
+- name: Remove the immutable attribute from /etc/resolv.conf before the update
+  ansible.builtin.command: chattr -i /etc/resolv.conf
+  changed_when: true
+  when:
+    - dns_resolver_rc_replace
+    - dns_resolver_rc_immutable
+    - not ansible_check_mode
+
+# Regular file or absent path: content changes are an atomic rename by the
+# template module; owner, group and mode are fixed in place.
+- name: Write /etc/resolv.conf
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: "0644"
+    follow: false
+  diff: false
+  when:
+    - not dns_resolver_rc_is_link
+    - dns_resolver_rc_compare is changed
+    - not ansible_check_mode
+
+# Symlink, including a dangling one or one whose target already holds the
+# desired text: the module above would unlink it and create an empty file
+# before its final move, so a staged file is renamed over the link instead.
+- name: Replace the /etc/resolv.conf symlink by a regular file
+  ansible.builtin.include_tasks: stage_resolv_conf.yml
+  when:
+    - dns_resolver_rc_is_link
+    - not ansible_check_mode
+
+- name: Set the immutable attribute on /etc/resolv.conf
+  ansible.builtin.command: chattr +i /etc/resolv.conf
+  changed_when: true
+  when:
+    - dns_resolver_rc_needs_lock
+    - not ansible_check_mode
+
+- name: Report the predicted /etc/resolv.conf type and attribute changes
+  ansible.builtin.debug:
+    msg: >-
+      {% if dns_resolver_rc_is_link %}The symlink /etc/resolv.conf ->
+      {{ dns_resolver_rc_stat.stat.lnk_target }}
+      ({{ 'dangling' if dns_resolver_rc_dangling else 'target exists' }})
+      would be replaced by a regular root:root 0644 file through a staged
+      rename, and the immutable attribute would be set.
+      {% elif not dns_resolver_rc_flags_known %}The immutable flag of
+      /etc/resolv.conf is unknown because lsattr is not installed yet; after
+      e2fsprogs is installed it would be read and set if missing.
+      {% else %}The immutable attribute would be set on /etc/resolv.conf.
+      {% endif %}
+  changed_when: true
+  when:
+    - dns_resolver_rc_needs_lock
+    - ansible_check_mode
+
+- name: Verify that /etc/resolv.conf is a regular file
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+    get_attributes: false
+    get_checksum: false
+  register: dns_resolver_rc_final
+  failed_when: not (dns_resolver_rc_final.stat.isreg | default(false))
+  when:
+    - dns_resolver_rc_needs_lock
+    - not ansible_check_mode
+
+- name: Verify that /etc/resolv.conf is immutable
+  ansible.builtin.command: lsattr -d /etc/resolv.conf
+  changed_when: false
+  failed_when: >-
+    dns_resolver_rc_locked.rc | default(1) != 0
+    or dns_resolver_rc_locked.stdout
+    is not match('^[A-Za-z-]*i[A-Za-z-]*[ ]+/etc/resolv[.]conf$')
+  register: dns_resolver_rc_locked
+  when:
+    - dns_resolver_rc_needs_lock
+    - not ansible_check_mode

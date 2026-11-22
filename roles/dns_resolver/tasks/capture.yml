@@ -1,0 +1,135 @@
+---
+# Every task here only reads, so all of them also run in check mode.
+
+- name: Inspect the original /etc/resolv.conf path
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+    get_attributes: false
+    get_checksum: true
+    checksum_algorithm: sha1
+  register: dns_resolver_orig_stat
+
+- name: Ensure /etc/resolv.conf is absent, a regular file or a symlink
+  ansible.builtin.assert:
+    that:
+      - dns_resolver_orig_stat.stat.isreg or dns_resolver_orig_stat.stat.islnk
+    fail_msg: >-
+      /etc/resolv.conf must be absent, a regular file or a symlink; nothing
+      was changed.
+    quiet: true
+  when: dns_resolver_orig_stat.stat.exists
+
+# Output is "<flags> /etc/resolv.conf"; flags are letters or "-". lsattr is
+# missing only in check mode on a host without e2fsprogs; the flag is then
+# recorded as unknown, never as clear.
+- name: Read the original /etc/resolv.conf attribute flags
+  ansible.builtin.command: lsattr -d /etc/resolv.conf
+  check_mode: false
+  changed_when: false
+  failed_when: >-
+    dns_resolver_orig_lsattr.rc | default(1) != 0
+    or dns_resolver_orig_lsattr.stdout
+    is not match('^[A-Za-z-]+[ ]+/etc/resolv[.]conf$')
+  register: dns_resolver_orig_lsattr
+  when:
+    - dns_resolver_orig_stat.stat.isreg | default(false)
+    - dns_resolver_lsattr_available
+
+# For a symlink this describes its target; a dangling link reports
+# exists=false.
+- name: Inspect the original /etc/resolv.conf contents through any symlink
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: true
+    get_attributes: false
+    get_checksum: true
+    checksum_algorithm: sha1
+  register: dns_resolver_orig_target_stat
+
+- name: Save the original /etc/resolv.conf contents
+  ansible.builtin.slurp:
+    src: /etc/resolv.conf
+  register: dns_resolver_orig_content
+  when: dns_resolver_orig_target_stat.stat.isreg | default(false)
+
+- name: Inspect the original systemd-resolved drop-in
+  ansible.builtin.stat:
+    path: "{{ dns_resolver_dropin_path }}"
+    follow: false
+    get_attributes: false
+    get_checksum: true
+    checksum_algorithm: sha1
+  register: dns_resolver_orig_dropin_stat
+
+- name: Ensure the drop-in path is absent or a regular file
+  ansible.builtin.assert:
+    that:
+      - dns_resolver_orig_dropin_stat.stat.isreg
+    fail_msg: >-
+      {{ dns_resolver_dropin_path }} must be absent or a regular file; nothing
+      was changed.
+    quiet: true
+  when: dns_resolver_orig_dropin_stat.stat.exists
+
+- name: Save the original systemd-resolved drop-in
+  ansible.builtin.slurp:
+    src: "{{ dns_resolver_dropin_path }}"
+  register: dns_resolver_orig_dropin_content
+  when: dns_resolver_orig_dropin_stat.stat.exists
+
+# systemd_service fails for a unit that is not installed yet.
+- name: Read the original systemd-resolved activity
+  ansible.builtin.command: systemctl is-active systemd-resolved.service  # noqa: command-instead-of-module
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  register: dns_resolver_orig_active
+
+# Persistent enablement, for example enabled, disabled or masked; empty when
+# the unit does not exist yet.
+- name: Read the original systemd-resolved enablement
+  ansible.builtin.command: systemctl is-enabled systemd-resolved.service  # noqa: command-instead-of-module
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  register: dns_resolver_orig_enabled
+
+- name: Record the original resolver state
+  ansible.builtin.set_fact:
+    dns_resolver_orig:
+      rc_type: >-
+        {{ 'absent' if not dns_resolver_orig_stat.stat.exists
+           else ('file' if dns_resolver_orig_stat.stat.isreg else 'link') }}
+      rc_checksum: "{{ dns_resolver_orig_stat.stat.checksum | default('') }}"
+      rc_owner: "{{ dns_resolver_orig_stat.stat.pw_name | default('root') }}"
+      rc_group: "{{ dns_resolver_orig_stat.stat.gr_name | default('root') }}"
+      rc_mode: "{{ dns_resolver_orig_stat.stat.mode | default('0644') }}"
+      rc_flags_known: >-
+        {{ not dns_resolver_orig_stat.stat.isreg | default(false)
+           or dns_resolver_lsattr_available }}
+      rc_immutable: >-
+        {{ dns_resolver_orig_stat.stat.isreg | default(false)
+           and dns_resolver_lsattr_available
+           and 'i' in dns_resolver_orig_lsattr.stdout.split()[0] }}
+      rc_link: "{{ dns_resolver_orig_stat.stat.lnk_target | default('') }}"
+      rc_link_generated: >-
+        {{ dns_resolver_orig_stat.stat.islnk | default(false)
+           and (dns_resolver_orig_stat.stat.lnk_source | default(''))
+           is match(dns_resolver_resolved_runtime_dir | regex_escape) }}
+      rc_target_checksum: >-
+        {{ dns_resolver_orig_target_stat.stat.checksum | default('') }}
+      rc_content: >-
+        {{ dns_resolver_orig_content.content | default('') }}
+      dropin_exists: "{{ dns_resolver_orig_dropin_stat.stat.exists }}"
+      dropin_checksum: >-
+        {{ dns_resolver_orig_dropin_stat.stat.checksum | default('') }}
+      dropin_owner: "{{ dns_resolver_orig_dropin_stat.stat.pw_name | default('root') }}"
+      dropin_group: "{{ dns_resolver_orig_dropin_stat.stat.gr_name | default('root') }}"
+      dropin_mode: "{{ dns_resolver_orig_dropin_stat.stat.mode | default('0644') }}"
+      dropin_content: >-
+        {{ dns_resolver_orig_dropin_content.content | default('') }}
+      service_existed: >-
+        {{ 'systemd-resolved' not in dns_resolver_missing_at_start }}
+      service_active: "{{ dns_resolver_orig_active.stdout == 'active' }}"
+      service_enabled: "{{ dns_resolver_orig_enabled.stdout | trim }}"

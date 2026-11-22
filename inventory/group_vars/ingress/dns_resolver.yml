@@ -1,0 +1,6 @@
+---
+dns_resolver_upstreams:
+  - "77.88.8.88:853#safe.dot.dns.yandex.net"
+  - "77.88.8.2:853#safe.dot.dns.yandex.net"
+  - "185.191.32.7:853#public.sdns.bi.zone"
+  - "185.191.32.8:853#public.sdns.bi.zone"
