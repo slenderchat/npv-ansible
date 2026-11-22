@@ -265,6 +265,15 @@ def inspect_sources(params, blockers):
                         problems.append(
                             '%s: backports from %s is outside the policy of '
                             'this role; remove it' % (entry['where'], uri))
+                    elif (entry['options'].get('signed-by') in KEYRINGS
+                          and set(entry['suites']) & set(SUITE_ARCHIVE)):
+                        # Signed by the Debian archive keyring for a managed
+                        # suite: a Debian mirror, not a vendor repository.
+                        problems.append(
+                            '%s: %s is signed by the Debian archive keyring '
+                            'for a managed suite, so it looks like a Debian '
+                            'mirror that this role does not migrate; remove '
+                            'or disable it manually' % (entry['where'], uri))
                     continue
                 reason = official_problem(entry, archive)
                 if reason:
