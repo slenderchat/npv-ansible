@@ -1,0 +1,70 @@
+---
+# Check mode reads only the local APT indexes, so on a fresh host apt may not
+# know chrony yet. "Installed" and "Candidate" are versions or "(none)"; an
+# unknown package produces no output.
+- name: Read the local APT metadata for chrony
+  ansible.builtin.command:
+    argv: [apt-cache, policy, chrony]
+  environment:
+    LC_ALL: C
+  check_mode: false
+  changed_when: false
+  register: chrony_policy
+  when: ansible_check_mode
+
+- name: Classify the chrony package as installed, candidate or missing
+  ansible.builtin.set_fact:
+    chrony_package_state: >-
+      {{ 'installed' if chrony_policy.stdout
+           is search('^ +Installed: [0-9]', multiline=True)
+         else 'candidate' if chrony_policy.stdout
+           is search('^ +Candidate: [0-9]', multiline=True)
+         else 'missing' }}
+  when: ansible_check_mode
+
+# The module never refreshes indexes in check mode; update_cache is also
+# disabled there to make that explicit.
+- name: Install chrony
+  ansible.builtin.apt:
+    name: chrony
+    state: present
+    update_cache: "{{ not ansible_check_mode }}"
+    cache_valid_time: 3600
+  when: not ansible_check_mode or chrony_package_state != 'missing'
+
+- name: Report the chrony installation that apt cannot simulate yet
+  ansible.builtin.debug:
+    msg: >-
+      chrony would be installed. The package transaction is unknown until APT
+      metadata for chrony is available on the host.
+  changed_when: true
+  when: ansible_check_mode and chrony_package_state == 'missing'
+
+# systemctl show exits 0 with LoadState=not-found for a missing unit and fails
+# only on genuine systemd errors; the service module would fail on such a unit.
+- name: Read the chrony.service load state
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv: [systemctl, show, --property=LoadState, --value, chrony.service]
+  check_mode: false
+  changed_when: false
+  register: chrony_unit
+  when: ansible_check_mode
+
+- name: Report the planned chrony.service activation
+  ansible.builtin.debug:
+    msg: chrony.service would be enabled and started after chrony is installed.
+  changed_when: true
+  when:
+    - ansible_check_mode
+    - chrony_package_state != 'installed'
+    - chrony_unit.stdout == 'not-found'
+
+- name: Enable and start chrony.service
+  ansible.builtin.systemd_service:
+    name: chrony.service
+    enabled: true
+    state: started
+  when: >-
+    not ansible_check_mode
+    or chrony_package_state == 'installed'
+    or chrony_unit.stdout != 'not-found'
