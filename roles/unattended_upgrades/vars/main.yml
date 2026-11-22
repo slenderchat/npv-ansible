@@ -1,0 +1,35 @@
+---
+# Internal constants of the unattended_upgrades role.
+
+# Sorted after the package's 20auto-upgrades and 50unattended-upgrades.
+unattended_upgrades_conf_path: /etc/apt/apt.conf.d/99npv-unattended-upgrades
+
+# Both timers are shipped by the apt package.
+unattended_upgrades_timers:
+  - apt-daily.timer
+  - apt-daily-upgrade.timer
+
+# Scalar options of the policy file. Booleans accept every spelling that
+# APT reads as true.
+unattended_upgrades_expected_settings:
+  - name: APT::Periodic::Enable
+    value: "1"
+  - name: APT::Periodic::Update-Package-Lists
+    value: "1"
+  - name: APT::Periodic::Unattended-Upgrade
+    value: "1"
+  - name: Unattended-Upgrade::Automatic-Reboot
+    value: "true"
+    boolean: true
+  - name: Unattended-Upgrade::Automatic-Reboot-Time
+    value: now
+  - name: Unattended-Upgrade::Automatic-Reboot-WithUsers
+    value: "true"
+    boolean: true
+
+unattended_upgrades_true_values: ["1", "yes", "true", "with", "on", "enable"]
+
+unattended_upgrades_origins_option: Unattended-Upgrade::Origins-Pattern
+unattended_upgrades_legacy_option: Unattended-Upgrade::Allowed-Origins
+unattended_upgrades_expected_origins:
+  - origin=Debian,codename=trixie-security,label=Debian-Security

@@ -16,6 +16,7 @@ This repository currently contains:
 - the `locale` role: [`roles/locale`](roles/locale);
 - the `chrony` role: [`roles/chrony`](roles/chrony);
 - the `apt_sources` role: [`roles/apt_sources`](roles/apt_sources);
+- the `unattended_upgrades` role: [`roles/unattended_upgrades`](roles/unattended_upgrades);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -177,6 +178,18 @@ Check and diff:
 
 - with `--check`, the role performs the same read-only inspection and stops on the same blockers; it lists the files to migrate, reports the removals and whether an index refresh would run, and writes nothing, refreshes nothing and contacts no mirror. A file whose directory does not exist yet is shown as a message;
 - with `--diff`, `debian.sources`, the preferences file and a reduced `/etc/apt/sources.list` show content diffs; removed files show their path state.
+
+### `unattended_upgrades`
+
+Enables daily automatic security upgrades with the `unattended-upgrades` package and the `apt-daily.timer` and `apt-daily-upgrade.timer` units of `apt`, keeping their packaged schedules: the indexes are refreshed and unattended upgrades run daily. The policy is written to `/etc/apt/apt.conf.d/99npv-unattended-upgrades` (`root:root 0644`) before the package is installed. It clears the inherited origin rules, so only package versions from the archive matching `origin=Debian,codename=trixie-security,label=Debian-Security` are eligible; versions from `trixie`, `trixie-updates`, backports or vendor repositories are not installed automatically. Sources, pinning, package-owned configuration and other settings such as mail and cleanup are left untouched.
+
+If an unattended upgrade leaves `/var/run/reboot-required`, the host reboots immediately, even if users are logged in over SSH; their sessions are disconnected. The role itself never runs an upgrade or reboots.
+
+Both timers must exist; a missing or masked timer stops the role before any change. After installing the package, a normal run reads the merged configuration with `apt-config dump`, including package defaults and files loaded after the role's own, and fails on a mismatch, naming the managed option and its expected value; the timers are enabled and started only after this check passes. Timers that are already active are not stopped, so a failed check does not cancel jobs they have already scheduled.
+
+Enabled timers and a verified configuration do not show that an upgrade or a reboot took place. That evidence is in `/var/log/unattended-upgrades/`, `journalctl -u apt-daily-upgrade.service` and `journalctl --list-boots`.
+
+Check and diff: with `--check` nothing is written, refreshed or started, and the effective configuration is compared only when the policy file is already current; with `--diff` the policy file shows a content diff. The package installation is simulated as for `chrony`.
 
 ## Planned playbooks
 
