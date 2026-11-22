@@ -1,0 +1,10 @@
+---
+- name: Set system default locale LANG to C.UTF-8
+  ansible.builtin.lineinfile:
+    path: /etc/locale.conf
+    regexp: '^\s*LANG='
+    line: LANG=C.UTF-8
+    create: true
+    owner: root
+    group: root
+    mode: "0644"

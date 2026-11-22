@@ -13,6 +13,7 @@ This repository currently contains:
 - the `hosts` role: [`roles/hosts`](roles/hosts);
 - the `hostname` role: [`roles/hostname`](roles/hostname);
 - the `dns_resolver` role: [`roles/dns_resolver`](roles/dns_resolver);
+- the `locale` role: [`roles/locale`](roles/locale);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -130,6 +131,12 @@ Check and diff:
 
 - with `--check`, the role reads the current state and predicts the package installation, the drop-in directory and file, the restart or activation, the replacement of a symlink by a regular file and the `i` flag. Without `lsattr` the prerequisite installation is predicted and the current `i` flag of a regular `/etc/resolv.conf` is reported as unknown; the run does not fail only for that. It does not start services, flush caches or send DNS queries, and the runtime verification is reported as deferred. On a host without the package, the planned installation and activation are shown as messages, because apt cannot refresh its lists and the unit does not exist yet.
 - with `--diff`, the drop-in and `/etc/resolv.conf` show one content diff each; for a symlink the "before" side is the target's contents, and for a dangling symlink it is empty.
+
+### `locale`
+
+Sets the persistent system default locale `LANG=C.UTF-8` in `/etc/locale.conf` with a single `ansible.builtin.lineinfile` task. The file is created if it is absent and kept as `root:root 0644`. An existing active `LANG=` line, quoted or not, is replaced; `LANGUAGE`, `LC_*` and commented lines, as well as other settings and comments, are kept. Locale generation and running sessions are not managed by this role.
+
+Check mode and diff mode are supported natively by the module: with `--check` a missing or different `LANG` is reported as a change without modifying the host, and with `--diff` the module shows the file contents before and after.
 
 ## Planned playbooks
 
