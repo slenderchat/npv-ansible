@@ -1,0 +1,99 @@
+---
+# Reinspects /etc/resolv.conf after package installation, which may have
+# replaced it. In check mode this is still the original state.
+
+- name: Inspect /etc/resolv.conf after package installation
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+    get_attributes: false
+    get_checksum: false
+  register: dns_resolver_rc_stat
+
+- name: Ensure /etc/resolv.conf is still absent, a regular file or a symlink
+  ansible.builtin.assert:
+    that:
+      - dns_resolver_rc_stat.stat.isreg or dns_resolver_rc_stat.stat.islnk
+    fail_msg: /etc/resolv.conf must be absent, a regular file or a symlink.
+    quiet: true
+  when: dns_resolver_rc_stat.stat.exists
+
+# For a symlink this tells whether its target exists (exists=false: dangling).
+- name: Inspect the target of /etc/resolv.conf
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: true
+    get_attributes: false
+    get_checksum: false
+  register: dns_resolver_rc_target_stat
+
+- name: Read the /etc/resolv.conf attribute flags
+  ansible.builtin.command: lsattr -d /etc/resolv.conf
+  check_mode: false
+  changed_when: false
+  failed_when: >-
+    dns_resolver_rc_lsattr.rc | default(1) != 0
+    or dns_resolver_rc_lsattr.stdout
+    is not match('^[A-Za-z-]+[ ]+/etc/resolv[.]conf$')
+  register: dns_resolver_rc_lsattr
+  when:
+    - dns_resolver_rc_stat.stat.isreg | default(false)
+    - dns_resolver_lsattr_available
+
+# The flag is unknown only in check mode without lsattr; it is never assumed
+# to be clear.
+- name: Record the type and immutable state of /etc/resolv.conf
+  ansible.builtin.set_fact:
+    dns_resolver_rc_is_link: "{{ dns_resolver_rc_stat.stat.islnk | default(false) }}"
+    dns_resolver_rc_dangling: >-
+      {{ dns_resolver_rc_stat.stat.islnk | default(false)
+         and not dns_resolver_rc_target_stat.stat.exists }}
+    dns_resolver_rc_flags_known: >-
+      {{ not dns_resolver_rc_stat.stat.isreg | default(false)
+         or dns_resolver_lsattr_available }}
+    dns_resolver_rc_immutable: >-
+      {{ dns_resolver_rc_stat.stat.isreg | default(false)
+         and dns_resolver_lsattr_available
+         and 'i' in dns_resolver_rc_lsattr.stdout.split()[0] }}
+
+# Content comparison. For a symlink with an existing target the "before" side
+# of the diff is the target's text; the type change is decided separately
+# from dns_resolver_rc_is_link, not from this comparison.
+- name: Compare /etc/resolv.conf with the template
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: "0644"
+    follow: false
+  check_mode: true
+  register: dns_resolver_rc_compare
+  when: not dns_resolver_rc_dangling
+
+# A dangling symlink has no readable text to diff. The planned change is
+# reported with the rendered contents instead; nothing is created on the
+# managed host for this prediction.
+- name: Report the planned replacement of a dangling /etc/resolv.conf symlink
+  ansible.builtin.debug:
+    msg:
+      - >-
+        /etc/resolv.conf is a dangling symlink to
+        {{ dns_resolver_rc_stat.stat.lnk_target }}; it has no readable
+        contents and would be replaced by a regular root:root 0644 file with
+        the following contents.
+      - "{{ lookup('ansible.builtin.template', 'resolv.conf.j2') }}"
+  changed_when: true
+  when:
+    - dns_resolver_rc_dangling
+    - ansible_check_mode
+
+- name: Record whether /etc/resolv.conf must be replaced and locked
+  ansible.builtin.set_fact:
+    dns_resolver_rc_replace: >-
+      {{ dns_resolver_rc_is_link or dns_resolver_rc_compare is changed }}
+    dns_resolver_rc_needs_lock: >-
+      {{ dns_resolver_rc_is_link
+         or dns_resolver_rc_compare is changed
+         or not dns_resolver_rc_flags_known
+         or not dns_resolver_rc_immutable }}

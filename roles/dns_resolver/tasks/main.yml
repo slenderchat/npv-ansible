@@ -1,0 +1,54 @@
+---
+- name: Validate the dns_resolver upstream list
+  ansible.builtin.assert:
+    that:
+      - dns_resolver_upstreams is defined
+      - dns_resolver_upstreams is sequence
+      - dns_resolver_upstreams is not string
+      - dns_resolver_upstreams is not mapping
+      - dns_resolver_upstreams | length > 0
+      - >-
+        dns_resolver_upstreams
+        | reject('match', dns_resolver_upstream_pattern) | list | length == 0
+      - >-
+        dns_resolver_upstreams | unique | list | length
+        == dns_resolver_upstreams | length
+      # systemd-resolved stores ports 53 and 853 as 0, which means 853 under
+      # strict DNS-over-TLS, so an explicit :53 would silently become :853.
+      - dns_resolver_upstreams | select('search', ':53#') | list | length == 0
+    fail_msg: >-
+      dns_resolver_upstreams must be a non-empty list of unique entries in the
+      form IPv4:port#tls-name with a port other than 53, for example
+      9.9.9.9:853#dns.quad9.net.
+    quiet: true
+
+# Installs only e2fsprogs, which provides lsattr, and only when it is missing;
+# no resolver state is changed.
+- name: Make the attribute tools available
+  ansible.builtin.include_tasks: prerequisites.yml
+
+# Read-only: records everything needed to restore the original state and
+# rejects unsupported path types before any resolver change.
+- name: Capture the original resolver state
+  ansible.builtin.include_tasks: capture.yml
+
+- name: Configure the resolver
+  block:
+    - name: Install the required packages
+      ansible.builtin.include_tasks: packages.yml
+
+    - name: Inspect /etc/resolv.conf after package installation
+      ansible.builtin.include_tasks: inspect_resolv_conf.yml
+
+    - name: Configure and activate systemd-resolved
+      ansible.builtin.include_tasks: resolved.yml
+
+    - name: Verify the effective resolver policy and the stub
+      ansible.builtin.include_tasks: verify.yml
+
+    - name: Commit /etc/resolv.conf
+      ansible.builtin.include_tasks: commit_resolv_conf.yml
+
+  rescue:
+    - name: Roll back the resolver state changed by this run
+      ansible.builtin.include_tasks: rollback.yml

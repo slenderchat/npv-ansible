@@ -1,0 +1,422 @@
+---
+# Restores only what differs from the state recorded by capture.yml: the
+# drop-in, the activity and enablement of systemd-resolved, and
+# /etc/resolv.conf with its immutable flag. Packages installed by this run are
+# kept. Every step tolerates failure; each result is verified by reading the
+# state back, and the final task reports the original error together with
+# what was and was not verified.
+
+- name: Keep the original dns_resolver error
+  ansible.builtin.set_fact:
+    dns_resolver_error: >-
+      {{ ansible_failed_task.name | default('unknown task') }}:
+      {{ ansible_failed_result.msg
+         | default(ansible_failed_result.stderr | default('unknown error')) }}
+    dns_resolver_rb_stage_errors: []
+
+- name: Restore the original resolver state
+  when: not ansible_check_mode
+  block:
+    # Drop-in.
+
+    - name: Inspect the current systemd-resolved drop-in
+      ansible.builtin.stat:
+        path: "{{ dns_resolver_dropin_path }}"
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        checksum_algorithm: sha1
+      register: dns_resolver_rb_dropin_stat
+      ignore_errors: true  # noqa: ignore-errors
+
+    - name: Record whether the drop-in differs from the original
+      ansible.builtin.set_fact:
+        dns_resolver_rb_dropin_changed: >-
+          {{ not (dns_resolver_rb_dropin_stat is succeeded
+                  and dns_resolver_rb_dropin_stat.stat.exists
+                  == dns_resolver_orig.dropin_exists
+                  and (not dns_resolver_orig.dropin_exists
+                       or (dns_resolver_rb_dropin_stat.stat.checksum
+                           == dns_resolver_orig.dropin_checksum
+                           and dns_resolver_rb_dropin_stat.stat.pw_name
+                           == dns_resolver_orig.dropin_owner
+                           and dns_resolver_rb_dropin_stat.stat.gr_name
+                           == dns_resolver_orig.dropin_group
+                           and dns_resolver_rb_dropin_stat.stat.mode
+                           == dns_resolver_orig.dropin_mode))) }}
+
+    - name: Restore the original systemd-resolved drop-in
+      ansible.builtin.copy:
+        content: "{{ dns_resolver_orig.dropin_content | b64decode }}"
+        dest: "{{ dns_resolver_dropin_path }}"
+        owner: "{{ dns_resolver_orig.dropin_owner }}"
+        group: "{{ dns_resolver_orig.dropin_group }}"
+        mode: "{{ dns_resolver_orig.dropin_mode }}"
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_dropin_changed
+        - dns_resolver_orig.dropin_exists
+
+    - name: Remove the systemd-resolved drop-in created by this run
+      ansible.builtin.file:
+        path: "{{ dns_resolver_dropin_path }}"
+        state: absent
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_dropin_changed
+        - not dns_resolver_orig.dropin_exists
+
+    - name: Inspect the drop-in after the rollback
+      ansible.builtin.stat:
+        path: "{{ dns_resolver_dropin_path }}"
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        checksum_algorithm: sha1
+      register: dns_resolver_rb_dropin_final
+      ignore_errors: true  # noqa: ignore-errors
+      when: dns_resolver_rb_dropin_changed
+
+    - name: Record whether the drop-in matches the original
+      ansible.builtin.set_fact:
+        dns_resolver_rb_dropin_ok: >-
+          {{ not dns_resolver_rb_dropin_changed
+             or (dns_resolver_rb_dropin_final is succeeded
+                 and dns_resolver_rb_dropin_final.stat.exists
+                 == dns_resolver_orig.dropin_exists
+                 and (not dns_resolver_orig.dropin_exists
+                      or (dns_resolver_rb_dropin_final.stat.checksum
+                          == dns_resolver_orig.dropin_checksum
+                          and dns_resolver_rb_dropin_final.stat.pw_name
+                          == dns_resolver_orig.dropin_owner
+                          and dns_resolver_rb_dropin_final.stat.gr_name
+                          == dns_resolver_orig.dropin_group
+                          and dns_resolver_rb_dropin_final.stat.mode
+                          == dns_resolver_orig.dropin_mode))) }}
+
+    # Service. A unit that existed before is returned to its original
+    # activity and, when it was plainly enabled or disabled, enablement.
+    # Other enablement states such as masked are never changed, and nothing
+    # is unmasked. A unit installed by this run is stopped if needed and
+    # left enabled as its package installed it.
+
+    - name: Read the current systemd-resolved activity
+      ansible.builtin.command: systemctl is-active systemd-resolved.service  # noqa: command-instead-of-module
+      changed_when: false
+      failed_when: false
+      register: dns_resolver_rb_active
+
+    - name: Read the current systemd-resolved enablement
+      ansible.builtin.command: systemctl is-enabled systemd-resolved.service  # noqa: command-instead-of-module
+      changed_when: false
+      failed_when: false
+      register: dns_resolver_rb_enabled
+
+    - name: Record whether the enablement must be restored
+      ansible.builtin.set_fact:
+        dns_resolver_rb_restore_enablement: >-
+          {{ dns_resolver_orig.service_existed
+             and dns_resolver_orig.service_enabled in ['enabled', 'disabled']
+             and dns_resolver_rb_enabled.stdout | trim
+             != dns_resolver_orig.service_enabled }}
+
+    - name: Restore the original systemd-resolved enablement
+      ansible.builtin.systemd_service:
+        name: systemd-resolved.service
+        enabled: "{{ dns_resolver_orig.service_enabled == 'enabled' }}"
+      ignore_errors: true  # noqa: ignore-errors
+      when: dns_resolver_rb_restore_enablement
+
+    - name: Restart systemd-resolved with the restored configuration
+      ansible.builtin.systemd_service:
+        name: systemd-resolved.service
+        state: restarted
+      register: dns_resolver_rb_restart
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_orig.service_active
+        - dns_resolver_rb_dropin_changed or dns_resolver_rb_active.stdout != 'active'
+
+    - name: Stop systemd-resolved, which was not running before this run
+      ansible.builtin.systemd_service:
+        name: systemd-resolved.service
+        state: stopped
+      register: dns_resolver_rb_stop
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - not dns_resolver_orig.service_active
+        - dns_resolver_rb_active.stdout == 'active'
+
+    - name: Read the systemd-resolved activity after the rollback
+      ansible.builtin.command: systemctl is-active systemd-resolved.service  # noqa: command-instead-of-module
+      changed_when: false
+      failed_when: false
+      register: dns_resolver_rb_active_after
+
+    - name: Read the systemd-resolved enablement after the rollback
+      ansible.builtin.command: systemctl is-enabled systemd-resolved.service  # noqa: command-instead-of-module
+      changed_when: false
+      failed_when: false
+      register: dns_resolver_rb_enabled_after
+
+    - name: Record whether the service states match the original
+      ansible.builtin.set_fact:
+        dns_resolver_rb_service_touched: >-
+          {{ dns_resolver_rb_restore_enablement
+             or dns_resolver_rb_restart is not skipped
+             or dns_resolver_rb_stop is not skipped }}
+        dns_resolver_rb_service_ok: >-
+          {{ (dns_resolver_rb_active_after.stdout == 'active')
+             == dns_resolver_orig.service_active
+             and (not dns_resolver_rb_restore_enablement
+                  or dns_resolver_rb_enabled_after.stdout | trim
+                  == dns_resolver_orig.service_enabled) }}
+
+    # /etc/resolv.conf.
+
+    - name: Inspect /etc/resolv.conf before the rollback
+      ansible.builtin.include_tasks: rollback_rc_state.yml
+
+    - name: Record whether /etc/resolv.conf needs to be restored
+      ansible.builtin.set_fact:
+        dns_resolver_rb_rc_changed: "{{ not dns_resolver_rb_rc_matches }}"
+        dns_resolver_rb_rc_type_before: "{{ dns_resolver_rb_rc_type }}"
+
+    - name: Remove the immutable attribute before restoring /etc/resolv.conf
+      ansible.builtin.command: chattr -i /etc/resolv.conf
+      changed_when: true
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_rb_rc_immutable
+
+    # Over a regular file or an absent path, copy replaces atomically.
+    - name: Restore the original regular /etc/resolv.conf
+      ansible.builtin.copy:
+        content: "{{ dns_resolver_orig.rc_content | b64decode }}"
+        dest: /etc/resolv.conf
+        owner: "{{ dns_resolver_orig.rc_owner }}"
+        group: "{{ dns_resolver_orig.rc_group }}"
+        mode: "{{ dns_resolver_orig.rc_mode }}"
+        follow: false
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_orig.rc_type == 'file'
+        - dns_resolver_rb_rc_type_before != 'link'
+
+    # Over a symlink, for example the one created by the package postinst,
+    # the saved file is staged and renamed over the link. A staging failure
+    # is recorded here so that the remaining recovery steps still run.
+    - name: Restore the original regular /etc/resolv.conf over a symlink
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_orig.rc_type == 'file'
+        - dns_resolver_rb_rc_type_before == 'link'
+      block:
+        - name: Stage the saved /etc/resolv.conf over the symlink
+          ansible.builtin.include_tasks: stage_resolv_conf.yml
+          vars:
+            dns_resolver_stage_content: "{{ dns_resolver_orig.rc_content | b64decode }}"
+            dns_resolver_stage_owner: "{{ dns_resolver_orig.rc_owner }}"
+            dns_resolver_stage_group: "{{ dns_resolver_orig.rc_group }}"
+            dns_resolver_stage_mode: "{{ dns_resolver_orig.rc_mode }}"
+      rescue:
+        - name: Record the failed restoration of the regular /etc/resolv.conf
+          ansible.builtin.set_fact:
+            dns_resolver_rb_stage_errors: >-
+              {{ dns_resolver_rb_stage_errors
+                 + ['restoring the regular /etc/resolv.conf: '
+                    ~ ansible_failed_task.name | default('unknown task') ~ ': '
+                    ~ ansible_failed_result.msg | default('unknown error')] }}
+
+    # +i is set only on a verified regular file with the original content,
+    # owner, group and mode, never on a surviving symlink.
+    - name: Verify the restored regular /etc/resolv.conf before locking it
+      ansible.builtin.stat:
+        path: /etc/resolv.conf
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        checksum_algorithm: sha1
+      register: dns_resolver_rb_restored
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_orig.rc_type == 'file'
+        - dns_resolver_orig.rc_immutable
+
+    - name: Restore the original immutable attribute on /etc/resolv.conf
+      ansible.builtin.command: chattr +i /etc/resolv.conf
+      changed_when: true
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_orig.rc_type == 'file'
+        - dns_resolver_orig.rc_immutable
+        - dns_resolver_rb_restored is succeeded
+        - dns_resolver_rb_restored.stat.isreg | default(false)
+        - dns_resolver_rb_restored.stat.checksum | default('') == dns_resolver_orig.rc_checksum
+        - dns_resolver_rb_restored.stat.pw_name | default('') == dns_resolver_orig.rc_owner
+        - dns_resolver_rb_restored.stat.gr_name | default('') == dns_resolver_orig.rc_group
+        - dns_resolver_rb_restored.stat.mode | default('') == dns_resolver_orig.rc_mode
+
+    - name: Restore the original /etc/resolv.conf symlink
+      ansible.builtin.file:
+        path: /etc/resolv.conf
+        src: "{{ dns_resolver_orig.rc_link }}"
+        state: link
+        force: true
+        follow: false
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_orig.rc_type == 'link'
+
+    - name: Remove /etc/resolv.conf, which was absent before this run
+      ansible.builtin.file:
+        path: /etc/resolv.conf
+        state: absent
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_rb_rc_changed
+        - dns_resolver_orig.rc_type == 'absent'
+
+    # A symlink target may no longer hold the original text: package
+    # installation can remove another resolver's file, and a target generated
+    # by systemd-resolved is only refreshed while the service runs.
+    - name: Check the contents behind the original /etc/resolv.conf symlink
+      ansible.builtin.stat:
+        path: /etc/resolv.conf
+        follow: true
+        get_attributes: false
+        get_checksum: true
+        checksum_algorithm: sha1
+      register: dns_resolver_rb_target
+      ignore_errors: true  # noqa: ignore-errors
+      when:
+        - dns_resolver_orig.rc_type == 'link'
+        - dns_resolver_orig.rc_target_checksum | length > 0
+
+    - name: Record whether the symlink target lost the original contents
+      ansible.builtin.set_fact:
+        dns_resolver_rb_target_lost: >-
+          {{ dns_resolver_rb_target is not skipped
+             and (dns_resolver_rb_target is failed
+                  or dns_resolver_rb_target.stat.checksum | default('')
+                  != dns_resolver_orig.rc_target_checksum)
+             and (not dns_resolver_orig.rc_link_generated
+                  or dns_resolver_rb_active_after.stdout != 'active') }}
+
+    - name: Replace the symlink by the saved original contents
+      when: dns_resolver_rb_target_lost
+      block:
+        - name: Stage the saved contents over the symlink
+          ansible.builtin.include_tasks: stage_resolv_conf.yml
+          vars:
+            dns_resolver_stage_content: "{{ dns_resolver_orig.rc_content | b64decode }}"
+      rescue:
+        - name: Record the failed replacement of the symlink
+          ansible.builtin.set_fact:
+            dns_resolver_rb_stage_errors: >-
+              {{ dns_resolver_rb_stage_errors
+                 + ['replacing the symlink by the saved contents: '
+                    ~ ansible_failed_task.name | default('unknown task') ~ ': '
+                    ~ ansible_failed_result.msg | default('unknown error')] }}
+
+    - name: Inspect /etc/resolv.conf after the rollback
+      ansible.builtin.include_tasks: rollback_rc_state.yml
+
+    - name: Record whether the saved contents replaced a lost symlink target
+      ansible.builtin.set_fact:
+        dns_resolver_rb_fallback_ok: >-
+          {{ dns_resolver_rb_target_lost
+             and dns_resolver_rb_rc_type == 'file'
+             and dns_resolver_rb_stat.stat.checksum | default('')
+             == dns_resolver_orig.rc_target_checksum }}
+
+    - name: Check name resolution through NSS after the rollback
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "20"
+          - getent
+          - ahostsv4
+          - "{{ dns_resolver_probe_name }}"
+      changed_when: false
+      failed_when: false
+      register: dns_resolver_rb_resolve
+      when: >-
+        dns_resolver_rb_dropin_changed
+        or dns_resolver_rb_rc_changed
+        or dns_resolver_rb_target_lost
+        or dns_resolver_rb_service_touched
+
+- name: Report the failed dns_resolver run and the recovery result
+  ansible.builtin.fail:
+    msg: "{{ dns_resolver_error }} | {{ dns_resolver_rb_report | join(' | ') }}"
+  vars:
+    dns_resolver_rb_attempted: >-
+      {{ dns_resolver_rb_dropin_changed
+         or dns_resolver_rb_rc_changed
+         or dns_resolver_rb_target_lost
+         or dns_resolver_rb_service_touched }}
+    dns_resolver_rb_dropin_line: >-
+      {{ ('drop-in: original restored and verified'
+          if dns_resolver_orig.dropin_exists
+          else 'drop-in: removed and verified absent')
+         if dns_resolver_rb_dropin_ok
+         else 'drop-in: restoration NOT verified; check '
+              ~ dns_resolver_dropin_path }}
+    dns_resolver_rb_service_line: >-
+      {{ ('systemd-resolved: '
+          ~ ('active' if dns_resolver_orig.service_active else 'inactive')
+          ~ (', ' ~ dns_resolver_orig.service_enabled
+             if dns_resolver_rb_restore_enablement else '')
+          ~ ' as before this run, verified')
+         if dns_resolver_rb_service_ok
+         else 'systemd-resolved: original state NOT verified (now '
+              ~ dns_resolver_rb_active_after.stdout ~ ', '
+              ~ dns_resolver_rb_enabled_after.stdout | trim ~ ')' }}
+    dns_resolver_rb_packages_line: >-
+      {{ 'packages this run installed or tried to install are not removed: '
+         ~ dns_resolver_missing_at_start | join(', ')
+         ~ ('; systemd-resolved is new, so it is not returned to a previous'
+            ~ ' enablement and stays enabled as installed'
+            if not dns_resolver_orig.service_existed else '') }}
+    dns_resolver_rb_rc_line: >-
+      {{ ('/etc/resolv.conf: the symlink target no longer held the original'
+          ~ ' contents; '
+          ~ ('replaced by a regular file with the saved contents, verified'
+             if dns_resolver_rb_fallback_ok
+             else 'replacing it with the saved contents was NOT verified'))
+         if dns_resolver_rb_target_lost
+         else ('/etc/resolv.conf: original ' ~ dns_resolver_orig.rc_type
+               ~ (' with +i' if dns_resolver_orig.rc_immutable else '')
+               ~ ' restored and verified')
+         if dns_resolver_rb_rc_matches
+         else ('/etc/resolv.conf: restoring the original '
+               ~ dns_resolver_orig.rc_type ~ ' was NOT verified; it is now '
+               ~ dns_resolver_rb_rc_type
+               ~ (' with +i' if dns_resolver_rb_rc_immutable
+                  else ' without +i')) }}
+    dns_resolver_rb_resolve_line: >-
+      {{ 'name resolution through NSS works after the rollback'
+         if dns_resolver_rb_resolve.rc | default(1) == 0
+         else 'name resolution through NSS still FAILS after the rollback' }}
+    dns_resolver_rb_report: >-
+      {{ ['check mode: nothing was changed or rolled back']
+         if ansible_check_mode
+         else ((['recovery: no resolver state had changed in this run, '
+                 ~ 'nothing was rolled back']
+                if not dns_resolver_rb_attempted
+                else [(dns_resolver_rb_dropin_line
+                       if dns_resolver_rb_dropin_changed else ''),
+                      (dns_resolver_rb_service_line
+                       if dns_resolver_rb_service_touched else ''),
+                      dns_resolver_rb_rc_line,
+                      dns_resolver_rb_resolve_line] | select | list)
+               + (dns_resolver_rb_stage_errors
+                  | map('regex_replace', '^', 'staging FAILED, ') | list)
+               + ([dns_resolver_rb_packages_line]
+                  if dns_resolver_missing_at_start | length > 0 else [])) }}

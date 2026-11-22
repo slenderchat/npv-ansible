@@ -1,0 +1,157 @@
+---
+- name: Report that runtime verification is deferred to a normal run
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: the effective systemd-resolved policy and the stub at
+      127.0.0.53 are not queried; they are verified on a normal run.
+  when: ansible_check_mode
+
+- name: Verify the resolver at runtime
+  when: not ansible_check_mode
+  block:
+    # One JSON object per property, in the order requested.
+    - name: Read the effective systemd-resolved settings
+      ansible.builtin.command:
+        argv:
+          - busctl
+          - --json=short
+          - get-property
+          - org.freedesktop.resolve1
+          - /org/freedesktop/resolve1
+          - org.freedesktop.resolve1.Manager
+          - DNSEx
+          - Domains
+          - FallbackDNSEx
+          - CurrentDNSServerEx
+          - DNSOverTLS
+          - LLMNR
+          - DNSStubListener
+      changed_when: false
+      register: dns_resolver_bus
+
+    # DNSEx and CurrentDNSServerEx entries are (ifindex, family, address
+    # bytes, port, name); Domains entries are (ifindex, domain, route-only);
+    # ifindex 0 is global. systemd 257 stores a configured port 53 or 853 as
+    # 0 and exports that stored value; with DNSOverTLS=yes, which is checked
+    # below, port 0 means 853. Any other port is compared as exported. With
+    # no current server, CurrentDNSServerEx has an empty address.
+    - name: Evaluate the effective resolver policy
+      ansible.builtin.set_fact:
+        dns_resolver_effective:
+          dns: "{{ dns_resolver_bus_global_dns | trim }}"
+          domains: "{{ dns_resolver_bus_global_domains | trim }}"
+          link_domains: "{{ dns_resolver_bus_link_domains | trim }}"
+          current: "{{ dns_resolver_bus_current | trim }}"
+          fallback_count: "{{ dns_resolver_bus_data[2] | length }}"
+          dns_over_tls: "{{ dns_resolver_bus_data[4] }}"
+          llmnr: "{{ dns_resolver_bus_data[5] }}"
+          stub_listener: "{{ dns_resolver_bus_data[6] }}"
+      vars:
+        dns_resolver_bus_data: >-
+          {{ dns_resolver_bus.stdout_lines | map('from_json')
+             | map(attribute='data') | list }}
+        dns_resolver_bus_global_dns: >-
+          {%- for s in dns_resolver_bus_data[0] if s[0] == 0 -%}
+          {{ ' ' if not loop.first else '' }}{{ s[2] | join('.' if s[1] == 2 else ',') }}:{{ 853 if s[3] == 0 else s[3] }}#{{ s[4] }}
+          {%- endfor -%}
+        dns_resolver_bus_global_domains: >-
+          {%- for d in dns_resolver_bus_data[1] if d[0] == 0 -%}
+          {{ ' ' if not loop.first else '' }}{{ '~' if d[2] else '' }}{{ d[1] }}
+          {%- endfor -%}
+        dns_resolver_bus_link_domains: >-
+          {%- for d in dns_resolver_bus_data[1] if d[0] != 0 -%}
+          {{ '; ' if not loop.first else '' }}ifindex {{ d[0] }}: {{ '~' if d[2] else '' }}{{ d[1] }}
+          {%- endfor -%}
+        dns_resolver_bus_current: >-
+          {{ ((dns_resolver_bus_data[3][2]
+               | join('.' if dns_resolver_bus_data[3][1] == 2 else ','))
+              ~ ':' ~ (853 if dns_resolver_bus_data[3][3] == 0
+                       else dns_resolver_bus_data[3][3])
+              ~ '#' ~ dns_resolver_bus_data[3][4])
+             if dns_resolver_bus_data[3][2] | length > 0 else '' }}
+
+    # Any per-link domain wins over the global "~." for the names it covers,
+    # so it is a conflict even before that link has DNS servers. DNS servers
+    # on a link without domains are not used and are not a conflict. Any
+    # approved upstream may be the current server.
+    - name: Fail when the effective policy differs from the approved policy
+      ansible.builtin.fail:
+        msg: >-
+          The effective systemd-resolved configuration would route public DNS
+          queries outside the approved {{ group_names | join('/') }} policy:
+          {{ dns_resolver_policy_problems | join('; ') }}.
+          Find later drop-ins with 'systemd-analyze cat-config
+          systemd/resolved.conf' (including /run/systemd/resolved.conf.d) and
+          per-link domains with 'resolvectl domain', remove the competing
+          source, and run the role again.
+      when: dns_resolver_policy_problems | length > 0
+      vars:
+        dns_resolver_expected_dns: "{{ dns_resolver_upstreams | join(' ') }}"
+        dns_resolver_policy_problems: >-
+          {{ [
+               ('global DNS= is "' ~ dns_resolver_effective.dns
+                ~ '", expected "' ~ dns_resolver_expected_dns ~ '"')
+               if dns_resolver_effective.dns != dns_resolver_expected_dns
+               else '',
+               ('global Domains= is "' ~ dns_resolver_effective.domains
+                ~ '", expected "~."')
+               if dns_resolver_effective.domains != '~.' else '',
+               ('per-link DNS domains take precedence over the global "~.": '
+                ~ dns_resolver_effective.link_domains)
+               if dns_resolver_effective.link_domains | length > 0 else '',
+               ('the current global server '
+                ~ dns_resolver_effective.current ~ ' is not approved')
+               if dns_resolver_effective.current | length > 0
+               and dns_resolver_effective.current not in dns_resolver_upstreams
+               else '',
+               'FallbackDNS= is not empty'
+               if dns_resolver_effective.fallback_count | int > 0 else '',
+               ('DNSOverTLS is "' ~ dns_resolver_effective.dns_over_tls
+                ~ '", expected "yes"')
+               if dns_resolver_effective.dns_over_tls != 'yes' else '',
+               ('LLMNR is "' ~ dns_resolver_effective.llmnr
+                ~ '", expected "no"')
+               if dns_resolver_effective.llmnr != 'no' else '',
+               ('DNSStubListener is "' ~ dns_resolver_effective.stub_listener
+                ~ '", expected "yes"')
+               if dns_resolver_effective.stub_listener != 'yes' else ''
+             ] | select | list }}
+
+    # Cache flushing is limited to runs that change or repair something; a
+    # converged run queries the stub without disturbing its cache.
+    - name: Flush the systemd-resolved caches before the stub query
+      ansible.builtin.command: resolvectl flush-caches
+      changed_when: true
+      when: dns_resolver_cutover
+
+    - name: Query deb.debian.org. through the stub at 127.0.0.53
+      ansible.builtin.command:
+        argv:
+          - dig
+          - "@127.0.0.53"
+          - -p
+          - "53"
+          - +time=5
+          - +tries=1
+          - +noall
+          - +answer
+          - "{{ dns_resolver_probe_name }}"
+          - A
+      changed_when: false
+      register: dns_resolver_probe
+      until: >-
+        dns_resolver_probe.rc == 0
+        and dns_resolver_probe.stdout is search('IN[ \t]+A[ \t]+[0-9]')
+      retries: 4
+      delay: 3
+
+    - name: Report the verified resolver path
+      ansible.builtin.debug:
+        msg: >-
+          The effective systemd-resolved policy matches the approved upstream
+          list ({{ dns_resolver_effective.dns }}), and the stub at 127.0.0.53
+          answered {{ dns_resolver_probe_name }}
+          {{ 'after a cache flush' if dns_resolver_cutover
+             else 'without a cache flush, so the answer may be cached' }}.
+          This verifies the configured resolver path, not that every upstream
+          answered individually.

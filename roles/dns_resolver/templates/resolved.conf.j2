@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+# The empty assignments reset lists inherited from earlier configuration files.
+[Resolve]
+DNS=
+DNS={{ dns_resolver_upstreams | join(' ') }}
+Domains=
+Domains=~.
+DNSOverTLS=yes
+DNSStubListener=yes
+LLMNR=no
+FallbackDNS=

@@ -1,0 +1,30 @@
+---
+# Packages are downloaded and installed while the original resolver is still
+# in place. On a first installation the Debian 13 systemd-resolved postinst can
+# replace /etc/resolv.conf with a symlink to the stub and start the service;
+# capture.yml has already saved what is needed to undo that.
+
+- name: Install the missing packages
+  ansible.builtin.apt:
+    name: "{{ dns_resolver_missing_packages }}"
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+  register: dns_resolver_apt
+  when:
+    - dns_resolver_missing_packages | length > 0
+    - not ansible_check_mode
+
+# In check mode apt cannot refresh its lists, so on a fresh host it may not
+# know the packages yet; the prediction is taken from dpkg instead.
+- name: Report the packages that would be installed
+  ansible.builtin.debug:
+    msg: >-
+      Would install: {{ dns_resolver_missing_packages | join(', ') }}.
+      Installing systemd-resolved for the first time can replace an unlocked
+      /etc/resolv.conf with a symlink and start the service.
+  changed_when: true
+  when:
+    - dns_resolver_missing_packages | length > 0
+    - ansible_check_mode

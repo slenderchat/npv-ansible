@@ -1,0 +1,58 @@
+---
+# Replaces /etc/resolv.conf, normally a symlink, by a complete regular file
+# without ever writing through the link. Each invocation allocates its own
+# unique file in /etc, on the same filesystem, sets the final content, owner,
+# group and mode on it, and only then renames it over the path; rename(2)
+# replaces the link itself. A failed preparation skips the rename and fails
+# this include. Only the file allocated here is removed afterwards.
+#
+# Input: dns_resolver_stage_content (optional; the template is used when it is
+# undefined), dns_resolver_stage_owner, dns_resolver_stage_group and
+# dns_resolver_stage_mode (default root, root, 0644).
+
+- name: Stage and rename the new /etc/resolv.conf
+  block:
+    - name: Allocate a unique /etc/resolv.conf staging file
+      ansible.builtin.tempfile:
+        path: /etc
+        prefix: .resolv.conf.dns_resolver.
+        state: file
+      register: dns_resolver_stage_tmp
+
+    - name: Stage /etc/resolv.conf from the template
+      ansible.builtin.template:
+        src: resolv.conf.j2
+        dest: "{{ dns_resolver_stage_tmp.path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      diff: false
+      when: dns_resolver_stage_content is not defined
+
+    - name: Stage /etc/resolv.conf from saved contents
+      ansible.builtin.copy:
+        content: "{{ dns_resolver_stage_content }}"
+        dest: "{{ dns_resolver_stage_tmp.path }}"
+        owner: "{{ dns_resolver_stage_owner | default('root') }}"
+        group: "{{ dns_resolver_stage_group | default('root') }}"
+        mode: "{{ dns_resolver_stage_mode | default('0644') }}"
+      diff: false
+      when: dns_resolver_stage_content is defined
+
+    - name: Rename the staged file over /etc/resolv.conf
+      ansible.builtin.command:
+        argv:
+          - mv
+          - --force
+          - --no-target-directory
+          - "{{ dns_resolver_stage_tmp.path }}"
+          - /etc/resolv.conf
+      changed_when: true
+
+  always:
+    # After a successful rename the allocated path no longer exists.
+    - name: Remove the staging file allocated by this invocation
+      ansible.builtin.file:
+        path: "{{ dns_resolver_stage_tmp.path }}"
+        state: absent
+      when: dns_resolver_stage_tmp.path is defined

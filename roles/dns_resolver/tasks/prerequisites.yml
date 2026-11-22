@@ -1,0 +1,53 @@
+---
+# lsattr (package e2fsprogs) must be available before the immutable flag of
+# the original /etc/resolv.conf is read. Installing e2fsprogs uses the
+# original resolver and does not change any resolver state.
+
+- name: Read the installation state of the required packages
+  ansible.builtin.command:
+    argv: "{{ dns_resolver_dpkg_query_argv + dns_resolver_packages }}"
+  check_mode: false
+  changed_when: false
+  # rc 1 only means that some of the packages are unknown to dpkg.
+  failed_when: dns_resolver_dpkg.rc not in [0, 1]
+  register: dns_resolver_dpkg
+
+- name: Record the packages missing before this run
+  ansible.builtin.set_fact:
+    dns_resolver_missing_at_start: >-
+      {{ dns_resolver_packages
+         | difference(dns_resolver_dpkg.stdout_lines
+                      | select('match', '^[^ ]+ ii')
+                      | map('split') | map('first') | list) }}
+
+- name: Install e2fsprogs before reading attribute flags
+  ansible.builtin.apt:
+    name: e2fsprogs
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - "'e2fsprogs' in dns_resolver_missing_at_start"
+    - not ansible_check_mode
+
+- name: Report that e2fsprogs would be installed first
+  ansible.builtin.debug:
+    msg: >-
+      Would install e2fsprogs before anything else. Until then lsattr is not
+      available, so the immutable flag of /etc/resolv.conf is reported as
+      unknown rather than clear.
+  changed_when: true
+  when:
+    - "'e2fsprogs' in dns_resolver_missing_at_start"
+    - ansible_check_mode
+
+# In a normal run e2fsprogs is installed at this point or the play has
+# already failed, so lsattr is unavailable only in check mode.
+- name: Record lsattr availability and the packages left to install
+  ansible.builtin.set_fact:
+    dns_resolver_lsattr_available: >-
+      {{ 'e2fsprogs' not in dns_resolver_missing_at_start
+         or not ansible_check_mode }}
+    dns_resolver_missing_packages: >-
+      {{ dns_resolver_missing_at_start | difference(['e2fsprogs']) }}

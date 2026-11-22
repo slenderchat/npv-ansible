@@ -1,0 +1,53 @@
+---
+# Reads the current /etc/resolv.conf and compares it with the original state
+# recorded by capture.yml. Used before and after the rollback.
+
+- name: Inspect the current /etc/resolv.conf path
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+    get_attributes: false
+    get_checksum: true
+    checksum_algorithm: sha1
+  register: dns_resolver_rb_stat
+  ignore_errors: true  # noqa: ignore-errors
+
+- name: Read the current /etc/resolv.conf attribute flags
+  ansible.builtin.command: lsattr -d /etc/resolv.conf
+  changed_when: false
+  failed_when: >-
+    dns_resolver_rb_lsattr.rc | default(1) != 0
+    or dns_resolver_rb_lsattr.stdout
+    is not match('^[A-Za-z-]+[ ]+/etc/resolv[.]conf$')
+  register: dns_resolver_rb_lsattr
+  ignore_errors: true  # noqa: ignore-errors
+  when: dns_resolver_rb_stat.stat.isreg | default(false)
+
+- name: Compare the current /etc/resolv.conf with the original state
+  ansible.builtin.set_fact:
+    dns_resolver_rb_rc_immutable: "{{ dns_resolver_rb_rc.immutable }}"
+    dns_resolver_rb_rc_matches: >-
+      {{ dns_resolver_rb_stat is succeeded
+         and dns_resolver_rb_lsattr is not failed
+         and dns_resolver_rb_rc.type == dns_resolver_orig.rc_type
+         and (dns_resolver_orig.rc_type != 'file'
+              or (dns_resolver_rb_stat.stat.checksum == dns_resolver_orig.rc_checksum
+                  and dns_resolver_rb_stat.stat.pw_name == dns_resolver_orig.rc_owner
+                  and dns_resolver_rb_stat.stat.gr_name == dns_resolver_orig.rc_group
+                  and dns_resolver_rb_stat.stat.mode == dns_resolver_orig.rc_mode
+                  and dns_resolver_rb_rc.immutable == dns_resolver_orig.rc_immutable))
+         and (dns_resolver_orig.rc_type != 'link'
+              or dns_resolver_rb_stat.stat.lnk_target == dns_resolver_orig.rc_link) }}
+    dns_resolver_rb_rc_type: "{{ dns_resolver_rb_rc.type }}"
+  vars:
+    dns_resolver_rb_rc:
+      type: >-
+        {{ 'unknown' if dns_resolver_rb_stat is failed
+           else 'absent' if not dns_resolver_rb_stat.stat.exists
+           else 'file' if dns_resolver_rb_stat.stat.isreg
+           else 'link' if dns_resolver_rb_stat.stat.islnk
+           else 'other' }}
+      immutable: >-
+        {{ dns_resolver_rb_stat.stat.isreg | default(false)
+           and dns_resolver_rb_lsattr is succeeded
+           and 'i' in dns_resolver_rb_lsattr.stdout.split()[0] }}
