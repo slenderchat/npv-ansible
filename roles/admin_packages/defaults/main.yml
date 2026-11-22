@@ -1,0 +1,14 @@
+---
+# Complete list of Debian binary packages for administering the host. A group
+# or host value replaces this list; it is not merged. Removing a name does not
+# uninstall the package, and an empty list does nothing.
+admin_packages_list:
+  - iproute2
+  - iputils-ping
+  - bind9-dnsutils
+  - curl
+  - tcpdump
+  - htop
+  - ncdu
+  - neovim
+  - hx
