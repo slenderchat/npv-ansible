@@ -1,0 +1,297 @@
+---
+# Key material, comments and file contents never appear in task output:
+# tasks that carry them use no_log, and content tasks disable diffs.
+
+- name: Validate the type of ssh_authorized_keys_list
+  ansible.builtin.assert:
+    that:
+      - ssh_authorized_keys_list is defined
+      - ssh_authorized_keys_list is sequence
+      - ssh_authorized_keys_list is not string
+      - ssh_authorized_keys_list is not mapping
+      - ssh_authorized_keys_list | length > 0
+      - >-
+        ssh_authorized_keys_list | select('string') | list | length
+        == ssh_authorized_keys_list | length
+    fail_msg: >-
+      ssh_authorized_keys_list must be a nonempty list of public key lines,
+      defined in the Vault-encrypted
+      inventory/group_vars/all/ssh_authorized_keys.yml. Nothing was changed.
+    quiet: true
+
+- name: Validate the form of each approved key line
+  ansible.builtin.assert:
+    that:
+      - >-
+        ssh_authorized_keys_list
+        | select('match', ssh_authorized_keys_line_re) | list | length
+        == ssh_authorized_keys_list | length
+    fail_msg: >-
+      Entries
+      {{ range(1, ssh_authorized_keys_list | length + 1)
+         | zip(ssh_authorized_keys_list)
+         | rejectattr(1, 'match', ssh_authorized_keys_line_re)
+         | map('first') | join(', ') }}
+      (1-based) of ssh_authorized_keys_list are not single plain public key
+      lines of type ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256/384/521,
+      sk-ssh-ed25519@openssh.com or sk-ecdsa-sha2-nistp256@openssh.com.
+      Key options, certificates and private keys are rejected. Nothing was
+      changed.
+    quiet: true
+
+- name: Validate that each approved key identity is unique
+  ansible.builtin.assert:
+    that:
+      - >-
+        ssh_authorized_keys_materials | unique(case_sensitive=true) | length
+        == ssh_authorized_keys_materials | length
+    fail_msg: >-
+      ssh_authorized_keys_list has
+      {{ ssh_authorized_keys_materials | length
+         - ssh_authorized_keys_materials | unique(case_sensitive=true) | length }}
+      duplicate key(s); keys are compared by type and key data, ignoring
+      comments. Nothing was changed.
+    quiet: true
+
+# ssh-keygen skips lines it cannot parse, so every approved line must yield
+# one fingerprint. Runs locally; no connection is made.
+- name: Parse the approved keys with ssh-keygen on the controller
+  ansible.builtin.command:
+    argv: [ssh-keygen, -l, -f, "-"]
+    stdin: "{{ ssh_authorized_keys_list | join('\n') }}"
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  no_log: true
+  register: ssh_authorized_keys_keygen
+
+- name: Require every approved key to be parseable by OpenSSH
+  ansible.builtin.assert:
+    that:
+      - ssh_authorized_keys_keygen.rc == 0
+      - >-
+        ssh_authorized_keys_keygen.stdout_lines | length
+        == ssh_authorized_keys_list | length
+    fail_msg: >-
+      ssh-keygen on the controller (rc {{ ssh_authorized_keys_keygen.rc }})
+      accepted {{ ssh_authorized_keys_keygen.stdout_lines | length }} of
+      {{ ssh_authorized_keys_list | length }} approved keys. Nothing was
+      changed.
+    quiet: true
+
+- name: Inspect /root/.ssh
+  ansible.builtin.stat:
+    path: "{{ ssh_authorized_keys_dir }}"
+    follow: false
+    get_checksum: false
+  register: ssh_authorized_keys_dir_stat
+
+- name: Inspect /root/.ssh/authorized_keys
+  ansible.builtin.stat:
+    path: "{{ ssh_authorized_keys_path }}"
+    follow: false
+    get_checksum: false
+  register: ssh_authorized_keys_file_stat
+
+- name: Ensure the paths are absent or of the expected type
+  ansible.builtin.assert:
+    that:
+      - not ssh_authorized_keys_dir_stat.stat.exists
+        or ssh_authorized_keys_dir_stat.stat.isdir
+      - not ssh_authorized_keys_file_stat.stat.exists
+        or ssh_authorized_keys_file_stat.stat.isreg
+    fail_msg: >-
+      /root/.ssh must be absent or a directory and
+      /root/.ssh/authorized_keys absent or a regular file, not a symlink or
+      another type. Nothing was changed.
+    quiet: true
+
+- name: Read /root/.ssh/authorized_keys
+  ansible.builtin.slurp:
+    src: "{{ ssh_authorized_keys_path }}"
+  no_log: true
+  register: ssh_authorized_keys_current
+  when: ssh_authorized_keys_file_stat.stat.exists
+
+- name: Report the planned key changes
+  ansible.builtin.debug:
+    msg: >-
+      /root/.ssh/authorized_keys:
+      {{ 'absent, to be created;' if not ssh_authorized_keys_file_stat.stat.exists
+         else '' }}
+      {{ ssh_authorized_keys_added }} key(s) to add,
+      {{ ssh_authorized_keys_removed }} key(s) to remove,
+      {{ ssh_authorized_keys_current_options | length }} entry(ies) with
+      options to replace or remove;
+      {{ 'only comments, order, duplicates or non-key lines change; '
+         if ssh_authorized_keys_added | int == 0
+            and not ssh_authorized_keys_proof_needed else '' }}
+      login proof {{ 'required' if ssh_authorized_keys_proof_needed
+                     else 'not required' }}.
+  when: ssh_authorized_keys_content_changed
+
+- name: Validate the proof identity on the controller
+  when: ssh_authorized_keys_proof_needed
+  block:
+    - name: Validate ssh_authorized_keys_proof_identity
+      ansible.builtin.assert:
+        that:
+          - ssh_authorized_keys_proof_identity is defined
+          - ssh_authorized_keys_proof_identity is string
+          - ssh_authorized_keys_proof_identity.endswith('.pub')
+          - ssh_authorized_keys_proof_file is file
+          - ssh_authorized_keys_proof_line is match(ssh_authorized_keys_line_re)
+          - ssh_authorized_keys_proof_material in ssh_authorized_keys_materials
+          - ansible_port is defined
+        fail_msg: >-
+          Removing or replacing an existing authorization needs a login proof.
+          Set ssh_authorized_keys_proof_identity to a controller path of a
+          readable public key file (*.pub) whose key is in
+          ssh_authorized_keys_list and whose private key is loaded in
+          ssh-agent, and define ansible_port. Nothing was changed.
+        quiet: true
+
+    # sshd uses the first matching entry, so an entry with options for the
+    # proof key would decide the proof; it is never edited before the proof.
+    - name: Ensure the proof key has no entry with options on the host
+      ansible.builtin.assert:
+        that:
+          - >-
+            ssh_authorized_keys_current_options
+            | select('search', ssh_authorized_keys_proof_material.split()[1]
+                               | regex_escape)
+            | list | length == 0
+        fail_msg: >-
+          The proof identity has an entry with key options in
+          /root/.ssh/authorized_keys. Choose another approved key as the proof
+          identity. Nothing was changed.
+        quiet: true
+
+# Tightening ownership and modes removes no access: sshd StrictModes only
+# rejects files that are too permissive.
+- name: Ensure /root/.ssh is a root-owned directory with mode 0700
+  ansible.builtin.file:
+    path: "{{ ssh_authorized_keys_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Ensure /root/.ssh/authorized_keys is root-owned with mode 0600
+  ansible.builtin.file:
+    path: "{{ ssh_authorized_keys_path }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0600"
+  when: ssh_authorized_keys_file_stat.stat.exists
+
+- name: Prove access with the proof identity before the change
+  when: ssh_authorized_keys_proof_needed and not ansible_check_mode
+  vars:
+    ssh_authorized_keys_probe_host: >-
+      {{ hostvars[inventory_hostname].ansible_host
+         | default(inventory_hostname) }}
+    ssh_authorized_keys_probe_port: >-
+      {{ hostvars[inventory_hostname].ansible_port | string }}
+  block:
+    # Appending keeps every existing entry, with its options, unchanged.
+    - name: Append the proof key to the existing entries
+      ansible.builtin.lineinfile:
+        path: "{{ ssh_authorized_keys_path }}"
+        line: "{{ ssh_authorized_keys_proof_entry }}"
+        insertafter: EOF
+        create: false
+      no_log: true
+      diff: false
+      register: ssh_authorized_keys_staged
+      when: >-
+        ssh_authorized_keys_proof_material
+        not in ssh_authorized_keys_current_plain
+
+    # A new process with only the proof identity as a raw public key
+    # (certificate algorithms removed from the default list), no
+    # multiplexing, no password or keyboard-interactive fallback and strict
+    # host key checking against the default known_hosts files. ssh_config
+    # files are ignored. The raw result stays internal.
+    - name: Log in as root over a fresh SSH connection
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - none
+          - -T
+          - -n
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=yes
+          - -o
+          - UpdateHostKeys=no
+          - -o
+          - ControlMaster=no
+          - -o
+          - ControlPath=none
+          - -o
+          - PreferredAuthentications=publickey
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
+          - -o
+          - IdentitiesOnly=yes
+          - -o
+          - PubkeyAcceptedAlgorithms=-*-cert-v01@openssh.com
+          - -o
+          - ConnectTimeout=30
+          - -i
+          - "{{ ssh_authorized_keys_proof_file }}"
+          - -l
+          - root
+          - -p
+          - "{{ ssh_authorized_keys_probe_port }}"
+          - --
+          - "{{ ssh_authorized_keys_probe_host }}"
+          - printf
+          - "{{ ssh_authorized_keys_probe_marker }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      no_log: true
+      register: ssh_authorized_keys_probe
+
+    - name: Require a successful login proof
+      ansible.builtin.assert:
+        that:
+          - ssh_authorized_keys_probe.rc == 0
+          - ssh_authorized_keys_probe.stdout == ssh_authorized_keys_probe_marker
+        fail_msg: >-
+          The login proof as root to {{ ssh_authorized_keys_probe_host }}
+          port {{ ssh_authorized_keys_probe_port }} failed:
+          rc {{ ssh_authorized_keys_probe.rc }}, success marker
+          {{ 'matched' if ssh_authorized_keys_probe.stdout
+                         == ssh_authorized_keys_probe_marker
+             else 'not matched' }}, approved proof key
+          {{ 'appended' if ssh_authorized_keys_staged is changed
+             else 'not appended' }}. Previous entries were kept.
+        quiet: true
+
+- name: Write exactly the approved keys
+  ansible.builtin.copy:
+    content: "{{ ssh_authorized_keys_desired }}"
+    dest: "{{ ssh_authorized_keys_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  diff: false
+  when: ssh_authorized_keys_dir_stat.stat.exists or not ansible_check_mode
+
+- name: Report the file that would be created
+  ansible.builtin.debug:
+    msg: >-
+      /root/.ssh/authorized_keys would be created (root:root 0600) with
+      {{ ssh_authorized_keys_list | length }} key(s).
+  changed_when: true
+  when: ansible_check_mode and not ssh_authorized_keys_dir_stat.stat.exists

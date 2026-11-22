@@ -18,6 +18,7 @@ This repository currently contains:
 - the `apt_sources` role: [`roles/apt_sources`](roles/apt_sources);
 - the `unattended_upgrades` role: [`roles/unattended_upgrades`](roles/unattended_upgrades);
 - the `admin_packages` role: [`roles/admin_packages`](roles/admin_packages);
+- the `ssh_authorized_keys` role: [`roles/ssh_authorized_keys`](roles/ssh_authorized_keys);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -211,6 +212,23 @@ Installs the packages for administering a host with one `ansible.builtin.apt` op
 Overrides go to `inventory/group_vars/<group_name>/admin_packages.yml` or `inventory/host_vars/<inventory_hostname>/admin_packages.yml`.
 
 With `--check` the role reads only the local APT metadata and does not refresh it or contact mirrors. apt simulates the packages that are installed or have an installation candidate there and, with `--diff`, shows their transaction. Packages that are neither are listed in a message reported as a change: until APT metadata for them is available, for example on a fresh host with incomplete indexes, the complete transaction cannot be determined.
+
+### `ssh_authorized_keys`
+
+Makes `/root/.ssh/authorized_keys` (`root:root 0600`, in `/root/.ssh` with `root:root 0700`) contain exactly the approved keys. sshd settings, ports, passwords, the firewall, fail2ban and Eternal Terminal belong to other roles.
+
+Inputs:
+
+- `ssh_authorized_keys_list` (required, no default) — the authoritative list of public key lines for all hosts, kept in a fully Vault-encrypted `inventory/group_vars/all/ssh_authorized_keys.yml`; a run needs the Vault password. Only plain keys are supported: `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`, `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, each with an optional comment. Key options, certificates, private keys, an empty or malformed list, keys that the controller's `ssh-keygen` cannot parse, and duplicate keys (same type and key data, whatever the comment) stop the role before any change.
+- `ssh_authorized_keys_proof_identity` — a controller path to a public key file (`*.pub`) whose key is in the list and whose private key is loaded in the controller's `ssh-agent`; pass it per run, for example `-e ssh_authorized_keys_proof_identity=~/.ssh/id_ed25519.pub`. It is required only when a proof is needed. Private keys are never read or copied.
+
+Adding keys or changing only comments, order, duplicates or comment lines needs no proof. Removing a key or replacing an entry with options (such as a provider's `command=` restriction) needs one: if the proof key is not yet in the file, it is appended without touching existing entries; then the controller opens a fresh `ssh` login as `root` to `ansible_host` (or the inventory name) on the current `ansible_port`, offering only the proof identity as a raw public key (certificate signature algorithms are removed from the default `PubkeyAcceptedAlgorithms`), with `-F none`, no connection sharing, no password or keyboard-interactive fallback and `StrictHostKeyChecking=yes` against the default `known_hosts` files. Only after it succeeds is the file replaced atomically. If the proof fails, the run fails and reports only the target, port, `ssh` exit code, whether the success marker matched and whether the proof key was appended; `ssh` output is not shown. The file then keeps all previous entries unchanged, plus the approved proof key at the end if it was missing, and the `root:root` ownership and `0700`/`0600` modes already applied to `/root/.ssh` and the file stay. The role stops if the proof key has an entry with options. A converged run writes nothing and opens no extra connection.
+
+First run: the role does not change ports. If a host still accepts SSH only on its original port, run with `-e ansible_port=<port>`; the proof uses the same value. The proof ignores `ssh_config` and Ansible's SSH arguments, so the host key must already be in the controller's `known_hosts`.
+
+Limits: the proof shows that root can log in with the proof identity at that moment, not that sshd reads this file (`AuthorizedKeysFile`, `AuthorizedKeysCommand`) or that the other keys work. The final file is not proven again after it is written, and a change made by another process between the read and the write is overwritten.
+
+Check and diff: with `--check`, ownership and mode changes and the file rewrite are predicted; nothing is appended and no proof is attempted. Key material, comments and file contents are never shown, also with `--diff`; a message reports the number of keys to add and remove, the entries with options to replace, whether only comments or order change, and whether a proof is required.
 
 ## Planned playbooks
 
