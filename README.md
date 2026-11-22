@@ -17,6 +17,7 @@ This repository currently contains:
 - the `chrony` role: [`roles/chrony`](roles/chrony);
 - the `apt_sources` role: [`roles/apt_sources`](roles/apt_sources);
 - the `unattended_upgrades` role: [`roles/unattended_upgrades`](roles/unattended_upgrades);
+- the `admin_packages` role: [`roles/admin_packages`](roles/admin_packages);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -190,6 +191,26 @@ Both timers must exist; a missing or masked timer stops the role before any chan
 Enabled timers and a verified configuration do not show that an upgrade or a reboot took place. That evidence is in `/var/log/unattended-upgrades/`, `journalctl -u apt-daily-upgrade.service` and `journalctl --list-boots`.
 
 Check and diff: with `--check` nothing is written, refreshed or started, and the effective configuration is compared only when the policy file is already current; with `--diff` the policy file shows a content diff. The package installation is simulated as for `chrony`.
+
+### `admin_packages`
+
+Installs the packages for administering a host with one `ansible.builtin.apt` operation (`state: present`, without recommended packages). Installed packages are not upgraded, and removing a name from the list does not uninstall it. Editors, capture privileges and Eternal Terminal are not configured by this role.
+
+`admin_packages_list` is the complete list of packages. A group or host value replaces the defaults rather than extending them, so an override must repeat every package it keeps; an empty list does nothing. Defaults:
+
+- `iproute2` — `ip` and `ss`;
+- `iputils-ping` — `ping`;
+- `bind9-dnsutils` — `dig` and `nslookup`;
+- `curl`;
+- `tcpdump`;
+- `htop`;
+- `ncdu`;
+- `neovim`;
+- `hx` — the Helix editor (the Debian package name).
+
+Overrides go to `inventory/group_vars/<group_name>/admin_packages.yml` or `inventory/host_vars/<inventory_hostname>/admin_packages.yml`.
+
+With `--check` the role reads only the local APT metadata and does not refresh it or contact mirrors. apt simulates the packages that are installed or have an installation candidate there and, with `--diff`, shows their transaction. Packages that are neither are listed in a message reported as a change: until APT metadata for them is available, for example on a fresh host with incomplete indexes, the complete transaction cannot be determined.
 
 ## Planned playbooks
 
