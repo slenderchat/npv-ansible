@@ -1,0 +1,164 @@
+---
+# systemctl show exits 0 with LoadState=not-found for a missing unit. Both
+# timers belong to apt, so a missing one is a host problem, also in check mode.
+- name: Read the load state of the APT timers
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv: [systemctl, show, --property=LoadState, --value, "{{ item }}"]
+  check_mode: false
+  changed_when: false
+  loop: "{{ unattended_upgrades_timers }}"
+  register: unattended_upgrades_timer_units
+
+- name: Ensure the APT timers are available
+  ansible.builtin.assert:
+    that: item.stdout == 'loaded'
+    fail_msg: >-
+      {{ item.item }} is {{ item.stdout }}; it is shipped by the apt package
+      and must be loadable. Nothing was changed.
+    quiet: true
+  loop: "{{ unattended_upgrades_timer_units.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# The policy is in place before the package or the timers can act on it.
+- name: Write the unattended-upgrades policy
+  ansible.builtin.copy:
+    src: 99npv-unattended-upgrades
+    dest: "{{ unattended_upgrades_conf_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: unattended_upgrades_conf
+
+# Check mode reads only the local APT indexes, so apt may not know the
+# package yet. An unknown package produces no output.
+- name: Read the local APT metadata for unattended-upgrades
+  ansible.builtin.command:
+    argv: [apt-cache, policy, unattended-upgrades]
+  environment:
+    LC_ALL: C
+  check_mode: false
+  changed_when: false
+  register: unattended_upgrades_package_policy
+  when: ansible_check_mode
+
+- name: Classify unattended-upgrades as installed, candidate or missing
+  ansible.builtin.set_fact:
+    unattended_upgrades_package_state: >-
+      {{ 'installed' if unattended_upgrades_package_policy.stdout
+           is search('^ +Installed: [0-9]', multiline=True)
+         else 'candidate' if unattended_upgrades_package_policy.stdout
+           is search('^ +Candidate: [0-9]', multiline=True)
+         else 'missing' }}
+  when: ansible_check_mode
+
+- name: Install unattended-upgrades
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+    update_cache: "{{ not ansible_check_mode }}"
+    cache_valid_time: 3600
+  when: not ansible_check_mode or unattended_upgrades_package_state != 'missing'
+
+- name: Report the installation that apt cannot simulate yet
+  ansible.builtin.debug:
+    msg: >-
+      unattended-upgrades would be installed. The package transaction is
+      unknown until APT metadata for unattended-upgrades is available on the
+      host.
+  changed_when: true
+  when: ansible_check_mode and unattended_upgrades_package_state == 'missing'
+
+# apt-config prints the configuration after every file is parsed, so package
+# defaults, later overrides and #clear directives are reflected. APT option
+# names are case-insensitive. A failed check stops the host before the timers
+# are activated; timers that are already active are not touched. In check
+# mode a pending policy edit has not taken effect and is not compared.
+- name: Verify the effective policy
+  when: not ansible_check_mode or not unattended_upgrades_conf.changed
+  block:
+    - name: Read the effective values of the managed options
+      ansible.builtin.command:
+        argv: >-
+          {{ ['apt-config', 'dump']
+             + (unattended_upgrades_expected_settings
+                | map(attribute='name') | list)
+             + [unattended_upgrades_origins_option,
+                unattended_upgrades_legacy_option] }}
+      environment:
+        LC_ALL: C
+      check_mode: false
+      changed_when: false
+      register: unattended_upgrades_effective
+
+    - name: Check the scalar options
+      ansible.builtin.assert:
+        that:
+          - unattended_upgrades_values | length == 1
+          - >-
+            unattended_upgrades_values[0] | lower
+            in unattended_upgrades_true_values
+            if item.boolean | default(false)
+            else unattended_upgrades_values[0] == item.value
+        fail_msg: >-
+          {{ item.name }} must be "{{ item.value }}"; the effective value is
+          {{ unattended_upgrades_values | map('to_json') | join(', ')
+             or 'unset' }}.
+        quiet: true
+      vars:
+        unattended_upgrades_values: >-
+          {{ unattended_upgrades_effective.stdout_lines
+             | select('match', item.name | regex_escape ~ ' "',
+                       ignorecase=True)
+             | map('regex_replace', '^[^ ]+ "', '')
+             | map('regex_replace', '";$', '')
+             | list }}
+      loop: "{{ unattended_upgrades_expected_settings }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # unattended-upgrades reads every direct child of these options as an
+    # entry, named or not.
+    - name: Check the allowed origin patterns
+      ansible.builtin.assert:
+        that:
+          - unattended_upgrades_entries == unattended_upgrades_expected_origins
+        fail_msg: >-
+          {{ unattended_upgrades_origins_option }} must list exactly
+          {{ unattended_upgrades_expected_origins | to_json }}; the effective
+          list is {{ unattended_upgrades_entries | to_json }}.
+        quiet: true
+      vars:
+        unattended_upgrades_entries: >-
+          {{ unattended_upgrades_effective.stdout_lines
+             | select('match', unattended_upgrades_origins_option
+                               | regex_escape ~ '::[^: ]* "',
+                       ignorecase=True)
+             | map('regex_replace', '^[^ ]+ "', '')
+             | map('regex_replace', '";$', '')
+             | list }}
+
+    - name: Check that no legacy allowed origins remain
+      ansible.builtin.assert:
+        that: unattended_upgrades_entries | length == 0
+        fail_msg: >-
+          {{ unattended_upgrades_legacy_option }} must be empty; the effective
+          list is {{ unattended_upgrades_entries | to_json }}.
+        quiet: true
+      vars:
+        unattended_upgrades_entries: >-
+          {{ unattended_upgrades_effective.stdout_lines
+             | select('match', unattended_upgrades_legacy_option
+                               | regex_escape ~ '::[^: ]* "',
+                       ignorecase=True)
+             | map('regex_replace', '^[^ ]+ "', '')
+             | map('regex_replace', '";$', '')
+             | list }}
+
+# A running timer is left alone; its packaged schedule is not overridden.
+- name: Enable and start the APT timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: "{{ unattended_upgrades_timers }}"
