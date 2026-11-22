@@ -1,0 +1,209 @@
+---
+- name: Validate apt_sources_components
+  ansible.builtin.assert:
+    that:
+      - apt_sources_components is sequence
+      - apt_sources_components is not string
+      - apt_sources_components is not mapping
+      - apt_sources_components | length > 0
+      - >-
+        apt_sources_components
+        | reject('in', apt_sources_supported_components) | list | length == 0
+      - >-
+        apt_sources_components | unique | list | length
+        == apt_sources_components | length
+    fail_msg: >-
+      apt_sources_components must be a non-empty list of unique entries from
+      {{ apt_sources_supported_components | join(', ') }}.
+    quiet: true
+
+- name: Validate apt_sources_backports_packages
+  ansible.builtin.assert:
+    that:
+      - apt_sources_backports_packages is sequence
+      - apt_sources_backports_packages is not string
+      - apt_sources_backports_packages is not mapping
+      - >-
+        apt_sources_backports_packages | reject('string') | list | length == 0
+      - >-
+        apt_sources_backports_packages
+        | reject('match', apt_sources_package_pattern) | list | length == 0
+      - >-
+        apt_sources_backports_packages | unique | list | length
+        == apt_sources_backports_packages | length
+    fail_msg: >-
+      apt_sources_backports_packages must be a list of unique exact Debian
+      binary package names, without patterns, whitespace, architecture
+      qualifiers or version and release selectors.
+    quiet: true
+
+- name: Inspect the Debian archive keyring and the CA bundle
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+  loop:
+    - "{{ apt_sources_keyring }}"
+    - "{{ apt_sources_ca_bundle }}"
+  register: apt_sources_trust
+
+- name: Ensure the keyring and the CA bundle are readable files
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.readable
+      - item.stat.size > 0
+    fail_msg: >-
+      {{ item.item }} must be a readable, non-empty file; it is provided by
+      {{ 'debian-archive-keyring' if item.item == apt_sources_keyring
+         else 'ca-certificates' }}. Nothing was changed.
+    quiet: true
+  loop: "{{ apt_sources_trust.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# Read-only, also in check mode: classifies the current sources and
+# preferences and, when a source or backports eligibility would be removed,
+# reads the local APT cache. It never contacts mirrors.
+- name: Plan the change of the APT sources
+  apt_sources_inspect:
+    components: "{{ apt_sources_components }}"
+    backports_packages: "{{ apt_sources_backports_packages }}"
+    sources_path: "{{ apt_sources_sources_path }}"
+    sources_content: "{{ apt_sources_sources_content }}"
+    preferences_path: "{{ apt_sources_preferences_path }}"
+    marker: "{{ apt_sources_marker }}"
+    refresh_flag_path: "{{ apt_sources_refresh_flag_path }}"
+  register: apt_sources_plan
+
+- name: Stop before any change if a manual decision is needed
+  ansible.builtin.fail:
+    msg: "{{ ['Nothing was changed.'] + apt_sources_plan.blockers }}"
+  when: apt_sources_plan.blockers | length > 0
+
+- name: Report the Debian source files that are migrated
+  ansible.builtin.debug:
+    msg: "{{ apt_sources_plan.migration_report }}"
+  when: apt_sources_plan.migration_report | length > 0
+
+# The restriction is in place before the backports source is enabled.
+- name: Restrict backports
+  when: apt_sources_backports_enabled | bool
+  block:
+    - name: Create the APT preferences directory
+      ansible.builtin.file:
+        path: "{{ apt_sources_preferences_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: not apt_sources_plan.preferences_dir_exists
+
+    - name: Write the backports preferences
+      ansible.builtin.copy:
+        content: "{{ apt_sources_preferences_content }}"
+        dest: "{{ apt_sources_preferences_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: not ansible_check_mode or apt_sources_plan.preferences_dir_exists
+
+    - name: Report the backports preferences that would be created
+      ansible.builtin.debug:
+        msg:
+          - "{{ apt_sources_preferences_path }} would be created:"
+          - "{{ apt_sources_preferences_content }}"
+      changed_when: true
+      when: ansible_check_mode and not apt_sources_plan.preferences_dir_exists
+
+# Set before the sources change, so that a run interrupted before a successful
+# refresh is retried by the next run.
+- name: Record a pending index refresh
+  ansible.builtin.copy:
+    content: "{{ apt_sources_marker }}\n"
+    dest: "{{ apt_sources_refresh_flag_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: apt_sources_plan.sources_change and not ansible_check_mode
+
+- name: Create the APT sources directory
+  ansible.builtin.file:
+    path: "{{ apt_sources_sources_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: not apt_sources_plan.sources_dir_exists
+
+- name: Write the Debian sources
+  ansible.builtin.copy:
+    content: "{{ apt_sources_sources_content }}"
+    dest: "{{ apt_sources_sources_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode or apt_sources_plan.sources_dir_exists
+
+- name: Report the Debian sources that would be created
+  ansible.builtin.debug:
+    msg:
+      - "{{ apt_sources_sources_path }} would be created:"
+      - "{{ apt_sources_sources_content }}"
+  changed_when: true
+  when: ansible_check_mode and not apt_sources_plan.sources_dir_exists
+
+- name: Reduce the migrated sources.list to a comment
+  ansible.builtin.copy:
+    content: "{{ apt_sources_legacy_content }}"
+    dest: "{{ apt_sources_legacy_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: apt_sources_plan.stub_sources_list
+
+- name: Remove the migrated Debian source files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ apt_sources_plan.remove_paths }}"
+
+# Removed only after the backports source is gone.
+- name: Remove the obsolete backports preferences
+  ansible.builtin.file:
+    path: "{{ apt_sources_preferences_path }}"
+    state: absent
+  when:
+    - not apt_sources_backports_enabled | bool
+    - apt_sources_plan.preferences_managed
+
+# Error-Mode=any turns partial acquisition failures into a failed command.
+- name: Refresh the APT indexes
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv: [apt-get, -q, -o, APT::Update::Error-Mode=any, update]
+  environment:
+    LC_ALL: C
+  changed_when: true
+  when:
+    - apt_sources_plan.sources_change or apt_sources_plan.refresh_pending
+    - not ansible_check_mode
+
+- name: Report that the APT indexes would be refreshed
+  ansible.builtin.debug:
+    msg: >-
+      The APT indexes would be refreshed
+      {{ 'after the source change' if apt_sources_plan.sources_change
+         else 'to retry a previously failed refresh' }}.
+  changed_when: true
+  when:
+    - apt_sources_plan.sources_change or apt_sources_plan.refresh_pending
+    - ansible_check_mode
+
+- name: Clear the pending index refresh
+  ansible.builtin.file:
+    path: "{{ apt_sources_refresh_flag_path }}"
+    state: absent
+  when:
+    - apt_sources_plan.sources_change or apt_sources_plan.refresh_pending
+    - not ansible_check_mode

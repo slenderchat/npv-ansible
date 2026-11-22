@@ -1,0 +1,10 @@
+---
+# Complete ordered list of Debian components for this host: unique entries
+# from main, contrib, non-free and non-free-firmware.
+apt_sources_components:
+  - main
+
+# Exact Debian binary package names that may be taken from trixie-backports
+# when selected explicitly as <package>/trixie-backports. An empty list
+# disables backports.
+apt_sources_backports_packages: []
