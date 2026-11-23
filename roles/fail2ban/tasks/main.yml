@@ -196,12 +196,12 @@
 - name: Report the runtime steps deferred to a normal run
   ansible.builtin.debug:
     msg: >-
-      Predicted: {{ ([fail2ban_dropin_path ~ ' changes']
-                      if fail2ban_dropin is changed else [])
-                     + (['fail2ban.service starts']
-                        if fail2ban_start is changed else [])
-                     + (['fail2ban.service reloads']
-                        if fail2ban_reload is changed else [])
+      Predicted: {{ (([fail2ban_dropin_path ~ ' changes']
+                       if fail2ban_dropin is changed else [])
+                      + (['fail2ban.service starts']
+                         if fail2ban_start is changed else [])
+                      + (['fail2ban.service reloads']
+                         if fail2ban_reload is changed else []))
                      | join('; ') }}.
       Observed now: {{ 'service not running, live jail not read'
                        if fail2ban_live is skipped
