@@ -1,0 +1,217 @@
+---
+# Check mode reads only the local APT indexes, so on a fresh host apt may not
+# know these packages yet. An unknown package produces no output.
+- name: Read the local APT metadata for the Fail2ban packages
+  ansible.builtin.command:
+    argv: [apt-cache, policy, "{{ item }}"]
+  environment:
+    LC_ALL: C
+  check_mode: false
+  changed_when: false
+  loop: "{{ fail2ban_packages }}"
+  register: fail2ban_policy
+  when: ansible_check_mode
+
+# Without an installed fail2ban there is no jail.d, binary or unit yet, so
+# the later tasks are only reported.
+- name: Classify the Fail2ban packages
+  ansible.builtin.set_fact:
+    fail2ban_missing: >-
+      {{ fail2ban_policy.results
+         | rejectattr('stdout', 'search',
+                      '^ +(Installed|Candidate): [0-9]', multiline=True)
+         | map(attribute='item') | list }}
+    fail2ban_installed: >-
+      {{ fail2ban_policy.results | selectattr('item', 'eq', 'fail2ban')
+         | selectattr('stdout', 'search', '^ +Installed: [0-9]',
+                      multiline=True)
+         | list | length > 0 }}
+  when: ansible_check_mode
+
+# Recommends stay off; every package the jail needs is listed. In check mode
+# the module never refreshes indexes and simulates the packages known
+# locally.
+- name: Install Fail2ban and nftables
+  ansible.builtin.apt:
+    name: "{{ fail2ban_install }}"
+    state: present
+    install_recommends: false
+    update_cache: "{{ not ansible_check_mode }}"
+    cache_valid_time: 3600
+  vars:
+    fail2ban_install: >-
+      {{ fail2ban_packages | difference(fail2ban_missing)
+         if ansible_check_mode else fail2ban_packages }}
+  when: fail2ban_install | length > 0
+
+- name: Report the packages that apt cannot simulate yet
+  ansible.builtin.debug:
+    msg: >-
+      Not installed and not in the local APT indexes:
+      {{ fail2ban_missing | join(', ') }}. The package transaction is unknown
+      until APT metadata for them is available on the host.
+  changed_when: true
+  when: ansible_check_mode and fail2ban_missing | length > 0
+
+- name: Report the deferred jail configuration and activation
+  ansible.builtin.debug:
+    msg:
+      - >-
+        fail2ban is not installed yet. A normal run would test this
+        {{ fail2ban_dropin_path }} with fail2ban-client --test, write it, and
+        enable and start fail2ban.service. None of this was checked now.
+      - "{{ lookup('ansible.builtin.file', 'npv-sshd.local') }}"
+  changed_when: true
+  when: ansible_check_mode and not fail2ban_installed
+
+# Read without following the final component: the validator and the copy
+# module write the drop-in into jail.d, so a symlink there would redirect the
+# write. Other package symlinks are not inspected or changed.
+- name: Inspect jail.d and the managed drop-in without following symlinks
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: ["{{ fail2ban_jail_dir }}", "{{ fail2ban_dropin_path }}"]
+  register: fail2ban_paths
+  when: not ansible_check_mode or fail2ban_installed
+
+- name: Ensure jail.d is a real directory and the drop-in absent or regular
+  ansible.builtin.assert:
+    that:
+      - fail2ban_dir_ok
+      - not fail2ban_file.exists or fail2ban_file.isreg
+    fail_msg: >-
+      Unsupported layout:
+      {{ fail2ban_jail_dir ~ ' must be a real directory; it is '
+         ~ ('missing' if not fail2ban_dir.exists
+            else 'a symlink' if fail2ban_dir.islnk else 'not a directory')
+         if not fail2ban_dir_ok
+         else fail2ban_dropin_path ~ ' must be absent or a regular file; it is '
+              ~ ('a symlink' if fail2ban_file.islnk | default(false)
+                 else 'not a regular file') }}.
+      Nothing was written.
+    quiet: true
+  vars:
+    fail2ban_dir: "{{ fail2ban_paths.results[0].stat }}"
+    fail2ban_file: "{{ fail2ban_paths.results[1].stat }}"
+    fail2ban_dir_ok: >-
+      {{ fail2ban_dir.exists and fail2ban_dir.isdir | default(false)
+         and not fail2ban_dir.islnk | default(false) }}
+  when: not ansible_check_mode or fail2ban_installed
+
+- name: Write the SSH jail override
+  ansible.builtin.copy:
+    src: npv-sshd.local
+    dest: "{{ fail2ban_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "{{ fail2ban_validate }}"
+  register: fail2ban_dropin
+  when: not ansible_check_mode or fail2ban_installed
+
+- name: Enable fail2ban.service
+  ansible.builtin.systemd_service:
+    name: fail2ban.service
+    enabled: true
+  when: not ansible_check_mode or fail2ban_installed
+
+# A service started here already reads the current drop-in.
+- name: Start fail2ban.service
+  ansible.builtin.systemd_service:
+    name: fail2ban.service
+    state: started
+  register: fail2ban_start
+  when: not ansible_check_mode or fail2ban_installed
+
+# Read-only, also in check mode, but only on a running service. The ping
+# waits only for the daemon's socket (Type=simple returns before it exists),
+# not for any jail.
+- name: Wait for the Fail2ban server to answer
+  ansible.builtin.command:
+    argv: [fail2ban-client, ping]
+  check_mode: false
+  changed_when: false
+  register: fail2ban_ping
+  until: fail2ban_ping.rc == 0
+  retries: 10
+  delay: 1
+  when: &fail2ban_running >-
+    not ansible_check_mode
+    or (fail2ban_installed and fail2ban_start is not changed)
+
+# One observation; a nonzero exit (jail or action missing) is kept for the
+# repair decision, not retried.
+- name: Read the port of the live sshd jail's nftables action
+  ansible.builtin.command:
+    argv: "{{ fail2ban_live_query }}"
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  register: fail2ban_live
+  when: *fail2ban_running
+
+- name: Repair the live configuration
+  when: fail2ban_live is not skipped and fail2ban_reload_needed
+  block:
+    - name: Test the Fail2ban configuration on disk
+      ansible.builtin.command:
+        argv: [fail2ban-client, --test]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Reload fail2ban.service
+      ansible.builtin.systemd_service:
+        name: fail2ban.service
+        state: reloaded
+      register: fail2ban_reload
+
+    - name: Read the port of the live sshd jail's nftables action again
+      ansible.builtin.command:
+        argv: "{{ fail2ban_live_query }}"
+      changed_when: false
+      failed_when: false
+      register: fail2ban_final
+      when: not ansible_check_mode
+
+# After a reload only its result counts; otherwise the first observation.
+- name: Verify the live sshd jail
+  ansible.builtin.assert:
+    that: fail2ban_result_ok
+    fail_msg: >-
+      {{ 'After a reload of the tested configuration, the'
+         if fail2ban_final is not skipped else 'The' }} running sshd jail
+      does not ban port {{ fail2ban_ssh_port }} with the nftables action.
+      "{{ fail2ban_live_query | join(' ') }}" exited {{ fail2ban_result.rc }}:
+      "{{ (fail2ban_result.stdout ~ ' ' ~ fail2ban_result.stderr) | trim }}".
+      {{ 'The jail sshd or its action nftables is not loaded; check the
+         backend, banaction and enabled settings in fail2ban-client -d.'
+         if fail2ban_result.rc != 0 else
+         'Another jail.d/*.local or jail.local overrides '
+         ~ fail2ban_dropin_path ~ '; compare with fail2ban-client -d.' }}
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Report the runtime steps deferred to a normal run
+  ansible.builtin.debug:
+    msg: >-
+      Predicted: {{ ([fail2ban_dropin_path ~ ' changes']
+                      if fail2ban_dropin is changed else [])
+                     + (['fail2ban.service starts']
+                        if fail2ban_start is changed else [])
+                     + (['fail2ban.service reloads']
+                        if fail2ban_reload is changed else [])
+                     | join('; ') }}.
+      Observed now: {{ 'service not running, live jail not read'
+                       if fail2ban_live is skipped
+                       else 'live sshd jail port "'
+                            ~ fail2ban_live.stdout | trim ~ '" (exit '
+                            ~ fail2ban_live.rc ~ ')' }}. A normal run would
+      test the new file in a copy of /etc/fail2ban, test the configuration
+      on disk before any reload, and verify the live jail on port
+      {{ fail2ban_ssh_port }}; none of these was performed now.
+  when: >-
+    ansible_check_mode and fail2ban_installed
+    and (fail2ban_dropin is changed or fail2ban_start is changed
+         or fail2ban_reload is changed)
