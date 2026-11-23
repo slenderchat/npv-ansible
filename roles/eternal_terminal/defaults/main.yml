@@ -1,0 +1,6 @@
+---
+# Check mode only; a normal run ignores it and requires ss. Set it to true
+# only when the same run, in a normal run, installs iproute2 (which
+# provides ss) before this role. A check run on a host without iproute2 then
+# defers the listener checks instead of failing.
+eternal_terminal_iproute2_install_planned: false

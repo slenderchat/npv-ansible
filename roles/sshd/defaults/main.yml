@@ -1,0 +1,16 @@
+---
+# Required for a change, without a default:
+# - sshd_authorized_keys: the approved plain public key lines that
+#   /root/.ssh/authorized_keys must hold exactly, one per line;
+# - sshd_proof_identity: a controller path of a public key file (*.pub)
+#   whose key is in sshd_authorized_keys and whose private key is loaded in
+#   ssh-agent.
+
+# Check mode only; a normal run ignores both and checks the host as it is.
+# Set one to true only when the same run, in a normal run, establishes the
+# prerequisite before this role:
+# - /root/.ssh/authorized_keys is created, replaced or corrected to
+#   root:root 0600 with exactly sshd_authorized_keys;
+sshd_authorized_keys_change_planned: false
+# - iproute2, which provides ss, is installed.
+sshd_iproute2_install_planned: false

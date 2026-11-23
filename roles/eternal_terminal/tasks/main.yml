@@ -16,6 +16,39 @@
       {{ eternal_terminal_arch.stdout }}. Nothing was changed.
     quiet: true
 
+# The listener checks read the socket table with ss (package iproute2), so
+# a host without it stops here, before any change.
+- name: Look for ss
+  ansible.builtin.stat:
+    path: /usr/bin/ss
+    get_checksum: false
+  register: eternal_terminal_ss_stat
+
+# Exit status 1: dpkg does not know the package.
+- name: Read the installation state of iproute2
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, "--showformat=${db:Status-Abbrev}", iproute2]
+  check_mode: false
+  changed_when: false
+  failed_when: eternal_terminal_iproute2_state.rc not in [0, 1]
+  register: eternal_terminal_iproute2_state
+  when: not eternal_terminal_ss_stat.stat.exists
+
+# Only a check run with eternal_terminal_iproute2_install_planned may
+# continue without ss, and only while iproute2 is not installed.
+- name: Ensure ss is available
+  ansible.builtin.assert:
+    that: eternal_terminal_ss_deferred
+    fail_msg: >-
+      {{ '/usr/bin/ss is missing although iproute2 is installed; reinstall
+         iproute2 (apt-get install --reinstall iproute2).'
+         if eternal_terminal_iproute2_state.stdout is match('ii')
+         else 'This role reads the TCP listeners with ss from the iproute2
+         package, which is not installed; install iproute2 first.' }}
+      Nothing was changed.
+    quiet: true
+  when: not eternal_terminal_ss_stat.stat.exists
+
 # The directories are shipped by apt. A failed item stops the host here, so
 # the source below is only published after both prerequisites are in place.
 - name: Write the keyring and the package restriction
@@ -123,8 +156,8 @@
   when: not ansible_check_mode or eternal_terminal_installed
 
 # The local socket table only; nothing connects to the listener. Read-only,
-# also in check mode, on a service that was already running. A service
-# started by this run gets up to 10 s to bind.
+# also in check mode, on a service that was already running, unless ss is
+# deferred. A service started by this run gets up to 10 s to bind.
 - name: Read the TCP listeners
   ansible.builtin.command:
     argv: "{{ eternal_terminal_ss }}"
@@ -142,7 +175,21 @@
   delay: 1
   when: >-
     not ansible_check_mode
-    or (eternal_terminal_installed and eternal_terminal_start is not changed)
+    or (eternal_terminal_installed and eternal_terminal_start is not changed
+        and not eternal_terminal_ss_deferred)
+
+- name: Report the listener checks deferred until iproute2 is installed
+  ansible.builtin.debug:
+    msg: >-
+      ss is not installed yet, and eternal_terminal_iproute2_install_planned
+      says that iproute2 is installed before this role in a normal run. TCP
+      {{ eternal_terminal_port }} was not read, so neither another holder of
+      the port nor etserver's own listener was checked now; a normal run
+      checks both. A restart is predicted only for a changed setting.
+  when: >-
+    eternal_terminal_ss_deferred
+    and eternal_terminal_installed
+    and eternal_terminal_start is not changed
 
 - name: Ensure the TCP listeners could be read
   ansible.builtin.assert:

@@ -22,7 +22,10 @@ This repository currently contains:
 - the `sshd` role: [`roles/sshd`](roles/sshd);
 - the `fail2ban` role: [`roles/fail2ban`](roles/fail2ban);
 - the `eternal_terminal` role: [`roles/eternal_terminal`](roles/eternal_terminal);
-- the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
+- the collection requirements: [`collections/requirements.yml`](collections/requirements.yml);
+- the base playbook: [`new_server.yml`](new_server.yml);
+- one standalone playbook per role: [`playbooks/`](playbooks);
+- the project configuration [`ansible.cfg`](ansible.cfg), which sets the inventory `inventory/hosts.yml` and the roles path `roles/`.
 
 Host groups:
 
@@ -33,10 +36,10 @@ Connection settings shared by all hosts are defined in `all.vars`.
 
 Inventory convention: connection variables such as `ansible_user`, `ansible_host` and `ansible_port` may stay in `inventory/hosts.yml`. Role variables for a group go to `inventory/group_vars/<group_name>/<role_name>.yml`, and role variables for a host go to `inventory/host_vars/<inventory_hostname>/<role_name>.yml`, where the directory name is the exact inventory hostname, for example `ingress-ru-tweb-msk1-01.sl-chat.ru`.
 
-To inspect the inventory locally:
+To inspect the inventory locally, from the repository root:
 
 ```sh
-ansible-inventory -i inventory/hosts.yml --graph
+ansible-inventory --graph
 ```
 
 ## Collections
@@ -46,6 +49,15 @@ Install the required collections on the controller:
 ```sh
 ansible-galaxy collection install -r collections/requirements.yml
 ```
+
+## Role isolation
+
+Every role under `roles/` is atomic and runs on its own (see [Standalone role playbooks](#standalone-role-playbooks)):
+
+- A role knows only its own purpose, inputs and host state. It uses its own files and variables prefixed with its own name. It does not include, import or depend on another role, read another role's defaults, vars, registered results or facts, or assume that another role ran before it.
+- A prerequisite outside its scope is checked on the host. If it is missing, the role stops before any change and names the package, file, setting or input that is needed; it never names, inspects or runs another role.
+- A role may expose one small fact about its own work, and may accept optional, narrowly named inputs for `--check` (default `false`). Such an input says that the same run establishes a prerequisite earlier in a normal run, so a check run may defer an observation that depends on it. A normal run ignores these inputs and always checks the host; with the defaults a check run is as strict as a normal run.
+- Only playbooks know which roles exist, their order and how a result of one role becomes an input of another. `new_server.yml` is the only playbook that maps results; see its table below.
 
 ## Roles
 
@@ -86,11 +98,15 @@ Behavior:
 - When an update is needed, the role temporarily clears `i` if it is set. Content changes use atomic replacement; owner, group and mode are corrected without replacing the file. If only `i` is missing, it is set without rewriting the file.
 - After setting `i`, the role reads the flags back and fails if `i` is missing. If an update fails after `i` was cleared, the role attempts to restore `i` and reports the original error together with the verification result.
 
-Requires `lsattr` and `chattr` (package `e2fsprogs`) and a filesystem that supports the immutable attribute on the managed host. While `i` is set, ordinary writes to `/etc/hosts`, including by cloud-init or provider agents, are blocked.
+Requires `lsattr` and `chattr` (`/usr/bin/lsattr` and `/usr/bin/chattr` from the package `e2fsprogs`) and a filesystem that supports the immutable attribute on the managed host; the role does not install `e2fsprogs`. Without either tool it stops before any change and asks to install `e2fsprogs`, or to reinstall it if it is installed without them.
+
+Optional input for `--check` only: `hosts_e2fsprogs_install_planned` (default `false`) means that the same run installs `e2fsprogs` before this role in a normal run. A check run without the tools and without an installed `e2fsprogs` then reports the current `i` flag as unknown instead of stopping. A normal run ignores it.
+
+While `i` is set, ordinary writes to `/etc/hosts`, including by cloud-init or provider agents, are blocked.
 
 Check and diff:
 
-- with `--check`, the role inspects the current state and predicts changes without modifying `/etc/hosts` or its attributes;
+- with `--check`, the role inspects the current state and predicts changes without modifying `/etc/hosts` or its attributes. Without the tools, the current `i` flag is reported as unknown only under `hosts_e2fsprogs_install_planned`; otherwise the check stops as a normal run would;
 - with `--diff`, content drift produces one before/after content diff; an attribute-only change has no content diff.
 
 ### `hostname`
@@ -139,6 +155,8 @@ Check and diff:
 
 - with `--check`, the role reads the current state and predicts the package installation, the drop-in directory and file, the restart or activation, the replacement of a symlink by a regular file and the `i` flag. Without `lsattr` the prerequisite installation is predicted and the current `i` flag of a regular `/etc/resolv.conf` is reported as unknown; the run does not fail only for that. It does not start services, flush caches or send DNS queries, and the runtime verification is reported as deferred. On a host without the package, the planned installation and activation are shown as messages, because apt cannot refresh its lists and the unit does not exist yet.
 - with `--diff`, the drop-in and `/etc/resolv.conf` show one content diff each; for a symlink the "before" side is the target's contents, and for a dangling symlink it is empty.
+
+Result: the fact `dns_resolver_missing_at_start` lists the required packages that were missing when the run started. A normal run installs them, `e2fsprogs` first; a check run only predicts that.
 
 ### `locale`
 
@@ -216,6 +234,8 @@ Overrides go to `inventory/group_vars/<group_name>/admin_packages.yml` or `inven
 
 With `--check` the role reads only the local APT metadata and does not refresh it or contact mirrors. apt simulates the packages that are installed or have an installation candidate there and, with `--diff`, shows their transaction. Packages that are neither are listed in a message reported as a change: until APT metadata for them is available, for example on a fresh host with incomplete indexes, the complete transaction cannot be determined.
 
+Result: the fact `admin_packages_planned` lists the requested packages that are not installed and that a normal run installs. Only a check run can leave any; after a normal run, and for an empty list, it is empty.
+
 ### `ssh_authorized_keys`
 
 Makes `/root/.ssh/authorized_keys` (`root:root 0600`, in `/root/.ssh` with `root:root 0700`) contain exactly the approved keys. sshd settings, ports, passwords, the firewall, fail2ban and Eternal Terminal belong to other roles.
@@ -223,7 +243,7 @@ Makes `/root/.ssh/authorized_keys` (`root:root 0600`, in `/root/.ssh` with `root
 Inputs:
 
 - `ssh_authorized_keys_list` (required, no default) — the authoritative list of public key lines for all hosts, kept in a fully Vault-encrypted `inventory/group_vars/all/ssh_authorized_keys.yml`; a run needs the Vault password. Only plain keys are supported: `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`, `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, each with an optional comment. Key options, certificates, private keys, an empty or malformed list, keys that the controller's `ssh-keygen` cannot parse, and duplicate keys (same type and key data, whatever the comment) stop the role before any change.
-- `ssh_authorized_keys_proof_identity` — a controller path to a public key file (`*.pub`) whose key is in the list and whose private key is loaded in the controller's `ssh-agent`; pass it per run, for example `-e ssh_authorized_keys_proof_identity=~/.ssh/id_ed25519.pub`. It is required only when a proof is needed. Private keys are never read or copied.
+- `ssh_authorized_keys_proof_identity` — a controller path to a public key file (`*.pub`) whose key is in the list and whose private key is loaded in the controller's `ssh-agent`; pass it per run, for example `-e "ssh_authorized_keys_proof_identity=$HOME/.ssh/id_ed25519.pub"`. It is required only when a proof is needed. Private keys are never read or copied.
 
 Adding keys or changing only comments, order, duplicates or comment lines needs no proof. Removing a key or replacing an entry with options (such as a provider's `command=` restriction) needs one: if the proof key is not yet in the file, it is appended without touching existing entries; then the controller opens a fresh `ssh` login as `root` to `ansible_host` (or the inventory name) on the current `ansible_port`, offering only the proof identity as a raw public key (certificate signature algorithms are removed from the default `PubkeyAcceptedAlgorithms`), with `-F none`, no connection sharing, no password or keyboard-interactive fallback and `StrictHostKeyChecking=yes` against the default `known_hosts` files. Only after it succeeds is the file replaced atomically. If the proof fails, the run fails and reports only the target, port, `ssh` exit code, whether the success marker matched and whether the proof key was appended; `ssh` output is not shown. The file then keeps all previous entries unchanged, plus the approved proof key at the end if it was missing, and the `root:root` ownership and `0700`/`0600` modes already applied to `/root/.ssh` and the file stay. The role stops if the proof key has an entry with options. A converged run writes nothing and opens no extra connection.
 
@@ -233,9 +253,11 @@ Limits: the proof shows that root can log in with the proof identity at that mom
 
 Check and diff: with `--check`, ownership and mode changes and the file rewrite are predicted; nothing is appended and no proof is attempted. Key material, comments and file contents are never shown, also with `--diff`; a message reports the number of keys to add and remove, the entries with options to replace, whether only comments or order change, and whether a proof is required.
 
+Result: the fact `ssh_authorized_keys_file_changed` is `true` when the run created `/root/.ssh/authorized_keys`, replaced its content or corrected its owner, group or mode, or would do so in check mode. An inspection alone leaves it `false`.
+
 ### `sshd`
 
-Hardens the OpenSSH server and moves it to port `22334` with one drop-in, `/etc/ssh/sshd_config.d/00-npv-sshd.conf` (`root:root 0644`). Keys stay in the `ssh_authorized_keys` role and fail2ban in the `fail2ban` role; Eternal Terminal, the firewall and provider controls are not managed.
+Hardens the OpenSSH server and moves it to port `22334` with one drop-in, `/etc/ssh/sshd_config.d/00-npv-sshd.conf` (`root:root 0644`). The role reads `/root/.ssh/authorized_keys` but never writes it. Fail2ban, Eternal Terminal, the firewall and provider controls are not managed.
 
 Effective policy, checked with `sshd -T`:
 
@@ -260,33 +282,40 @@ SFTP. The role requires a `Subsystem sftp` line in the effective configuration a
 
 For a change, additionally:
 
-- `ssh_authorized_keys_list` and `ssh_authorized_keys_proof_identity` as in the `ssh_authorized_keys` role (the role loads that role's contract); the proof key is approved and loaded in `ssh-agent`;
-- `/root/.ssh/authorized_keys` is a `root`-owned regular file with mode `0600` that holds exactly the approved keys. Role order: run `ssh_authorized_keys` before `sshd`, in the same play and with the same proof identity;
+- `sshd_authorized_keys` (no default) — the approved plain public key lines (`ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`, `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, without options or certificates). The repository's playbooks pass the Vault list `ssh_authorized_keys_list`, so the keys exist only once;
+- `sshd_proof_identity` (no default) — a controller path to a public key file (`*.pub`) whose key is in `sshd_authorized_keys` and whose private key is loaded in `ssh-agent`. The playbooks pass `ssh_authorized_keys_proof_identity`, given with `-e`;
+- `/root/.ssh/authorized_keys` is a regular file owned by `root:root` with mode `0600` that holds exactly the lines of `sshd_authorized_keys`, one per line. The role only compares it; it must be in place before the change;
 - for a port change, the host-key trust below;
-- `ss` (iproute2) and `systemd-run` on the host, and `ssh`, `sftp` and `ssh-keygen` on the controller.
+- `systemd-run` on the host, and `ssh`, `sftp` and `ssh-keygen` on the controller.
+
+On every run, also without a change, the role needs `/usr/bin/ss` (package `iproute2`) on the host; without it the role stops before any change and asks to install `iproute2`, or to reinstall it if it is installed without `ss`.
+
+Optional inputs for `--check` only (default `false`; a normal run ignores them and checks the host):
+
+- `sshd_authorized_keys_change_planned` — the same run creates, replaces or corrects `/root/.ssh/authorized_keys` to exactly `sshd_authorized_keys` (`root:root 0600`) before this role. The key-file comparison is then reported as deferred; `sshd_authorized_keys` and `sshd_proof_identity` are still validated;
+- `sshd_iproute2_install_planned` — the same run installs `iproute2` before this role. With `ss` missing and `iproute2` not installed, reading the listeners is then reported as deferred.
 
 Controller proofs. Every proof is a new `ssh` or `sftp` process on the controller with `-F none`, only the proof identity as a raw public key (certificate algorithms removed), `User=root`, `BatchMode`, no connection sharing (`ControlMaster=no`, `ControlPath=none`), no password or keyboard-interactive fallback, `StrictHostKeyChecking=yes` and `UpdateHostKeys=no` against `~/.ssh/known_hosts` only. It never uses Ansible's connection or an existing master connection. The SFTP proof runs the read-only batch command `ls /`, which uploads and creates nothing. Results are reduced to the host, port, exit code and whether the success marker matched; raw output and key material are not shown.
 
 Host-key trust. A connection to a port other than 22 looks up `[address]:port` in `known_hosts`. Before a port change the role requires that `~/.ssh/known_hosts` trusts `[address]:22334` with exactly the host keys trusted for the current name (`address` for port 22), without `@cert-authority` or `@revoked` markers. Nothing is learned on first use and `ssh-keyscan` is not used. After the fingerprint for port 22 has been verified, copy the trusted entries under the new name:
 
 ```sh
-host=46.149.69.224
-ssh-keygen -F "$host" -f ~/.ssh/known_hosts
-ssh-keygen -F "$host" -f ~/.ssh/known_hosts \
-  | awk -v name="[$host]:22334" '!/^[#@]/ { $1 = name; print }' \
-  >> ~/.ssh/known_hosts
+address='<ansible_host>'
+```
+
+```sh
+ssh-keygen -F "$address" -f "$HOME/.ssh/known_hosts"
+```
+
+```sh
+ssh-keygen -F "$address" -f "$HOME/.ssh/known_hosts" \
+  | awk -v name="[$address]:22334" '!/^[#@]/ { $1 = name; print }' \
+  >> "$HOME/.ssh/known_hosts"
 ```
 
 The same entry lets the next Ansible run on port `22334` verify the host.
 
-Bootstrap of a fresh host reachable on port 22, one host at a time. The repository has no playbook yet; use a play of your own that applies `ssh_authorized_keys` and then `sshd`, with `sshd` last:
-
-```sh
-ansible-playbook -i inventory/hosts.yml <your-play>.yml --limit <host> \
-  -e ansible_port=22 \
-  -e ssh_authorized_keys_proof_identity=~/.ssh/id_ed25519.pub \
-  --ask-vault-pass
-```
+Bootstrap of a fresh host reachable on port 22, one host at a time, with [`new_server.yml`](#new_serveryml), which runs `ssh_authorized_keys` before `sshd` and `sshd` last; the check and apply commands for port 22 are under [`new_server.yml`](#new_serveryml).
 
 `-e ansible_port=22` is the current connection port; the listener port is always `22334`. Steps and the port that stays usable:
 
@@ -303,7 +332,7 @@ Normal use on 22334. On a host already reached on 22334, for example one configu
 
 Recovery. The timer is the recovery path until the cancel succeeds. If it fires while the run is still working, its rollback waits for the lock, so a promotion that is reloading sshd finishes first; it then removes the token, so the next promotion of that run fails without changing the drop-in and the cancel fails: the run never reports success for a state the rollback may have replaced. A stale run, timer or rescue cannot act on a later operation, because every action checks its own ID under the lock and the candidate and timer carry the ID. If the controller is lost after the final reload, the live sshd listens on 22334 only, and the timer restores the previous drop-in and reopens 22 600 s after it was armed (`systemctl list-timers 'npv-sshd-rollback*'`). Restoration is delayed while another holder keeps the lock (at most a `systemctl reload`), and prevented by a reboot, a stopped timer or a failed reload; the result is in `journalctl -u npv-sshd-rollback-<ID>.service`. A reboot removes the timer and the token. A candidate that has not been promoted is not read by sshd, so the host boots with the previous drop-in. A promoted drop-in was validated in the composed configuration, but its login may not have been proved yet, and nothing rolls it back after a reboot. `/etc/ssh/npv-sshd.rollback` remains and stops the next run with these instructions: without `complete`, nothing was promoted, so remove the directory and the token; otherwise either restore `dropin` with `cp -p` (or remove the drop-in if `absent` exists), run `sshd -t` and `systemctl reload ssh` and check a second login, or keep the current drop-in after checking a login on every port that `sshd -T` shows; then remove the directory, the token and `/etc/ssh/npv-sshd.candidate.*`. Console access through the provider remains the last resort and is outside this role.
 
-Check and diff: with `--check` on port 22 or 22334, the role performs the same read-only inspection and stops on the same blockers, shows the final drop-in as a diff (it contains no key material) and lists the planned steps. It writes nothing, arms no timer, reloads nothing and opens no proof connection; the login proofs, the `sshd -t -f`/`sshd -T -f` checks of the composed candidate, the reload, the command and SFTP proofs on 22334 and the listener verification are reported as deferred to a normal run.
+Check and diff: with `--check` on port 22 or 22334, the role performs the same read-only inspection and stops on the same blockers, shows the final drop-in as a diff (it contains no key material) and lists the planned steps. It writes nothing, arms no timer, reloads nothing and opens no proof connection; the login proofs, the `sshd -t -f`/`sshd -T -f` checks of the composed candidate, the reload, the command and SFTP proofs on 22334 and the listener verification are reported as deferred to a normal run. The key-file comparison and the listener reads are deferred only under the optional inputs above; without them, a wrong key file or a missing `ss` stops the check as it stops a normal run.
 
 Limits: trust is read only from `~/.ssh/known_hosts`; `ansible_host` must be a host name or an IPv4 address; the proofs show that the proof identity works, not that every approved key does.
 
@@ -337,6 +366,8 @@ The upstream repository publishes `et` for `amd64` and `arm64`; on any other `dp
 
 Listener. The role reads the local socket table with `ss -Hltnp` and classifies TCP `20222`: owned only by `etserver` (healthy), held by another process, or free. A service started by the run gets up to 10 s to bind. A service that was already running is restarted once if a setting changed or if it does not own the port, for example when an interrupted run wrote `20222` but the old daemon still listens on `2022`. A healthy service with current settings is not restarted. If another process holds `20222`, the role names it and stops before any restart, because a restart cannot take the port and would stop etserver on its old port. After a restart the table is read again for up to 10 s. If etserver still does not own `20222` after a start or a restart, the run fails with the role's diagnostic and the ports etserver does listen on, taken from the last reading; if `ss` itself fails, its exit code and error are reported instead. Restarts: none on a first install (one start) and on a converged host; one when settings change on an existing installation or to repair the interrupted case above.
 
+The listener checks need `/usr/bin/ss` (package `iproute2`), which the role does not install. Without it the role stops before any change and asks to install `iproute2`, or to reinstall it if it is installed without `ss`. Optional input for `--check` only: `eternal_terminal_iproute2_install_planned` (default `false`) means that the same run installs `iproute2` before this role in a normal run. A check run without `ss` and without an installed `iproute2` then reports the listener read as deferred and predicts a restart of a running service only for a changed setting. A normal run ignores it.
+
 TCP `20222` must be reachable from the client; the role opens no firewall or provider port and adds no source allowlist. The `fail2ban` role's `sshd` jail protects SSH on `22334`, which every session uses to start; `20222` is not watched.
 
 Updates. The role does not upgrade `et`. `apt-daily.timer` refreshes the upstream index, but the `unattended_upgrades` policy allows only `origin=Debian,codename=trixie-security,label=Debian-Security`, so `et` is never upgraded automatically. Upgrade it by hand with `apt-get install --only-upgrade et`; the package stops and starts `et.service`, and if a new release changes `/etc/et.cfg`, keep the local version.
@@ -351,11 +382,143 @@ The bootstrap `ssh` reads `~/.ssh/config` and `known_hosts`, so the name must re
 
 Check and diff: with `--check` the architecture check runs, the three files show content diffs and a needed refresh is reported, but no index is refreshed. If `et` is installed or has a candidate in the local indexes, apt simulates the installation. Without an installed `et`, the configuration, the unit and the listener cannot be observed: setting `port` to `20222` and `telemetry` to `false`, enabling, starting and the listener check are reported as deferred. On an installed host both settings show as a diff and a start is predicted for a stopped service. For a running service the socket table is read (read-only) and a restart is predicted if a setting changes or etserver does not own `20222`; another holder of the port stops the run as in a normal run. No service is started or restarted and nothing connects to the listener.
 
+## Playbooks
+
+Run every command from the repository root. Its [`ansible.cfg`](ansible.cfg) sets `inventory = ./inventory/hosts.yml` and `roles_path = ./roles`; Ansible resolves both relative to that file, so `new_server.yml` and the standalone playbooks under `playbooks/` need neither `-i` nor a roles path. Ansible reads `ansible.cfg` only from the current directory (unless `ANSIBLE_CONFIG` names another file) and ignores it in a world-writable directory; `ansible-config dump --only-changed` shows which file and values are in use. The file holds no Vault password and no identity path; pass them with each run.
+
+Without `--limit`, a playbook selects every inventory host, still one host at a time; the commands below limit each run to one host. `--check --diff` (short `-C -D`) changes nothing on the host, but still connects to every selected host over SSH to read its state, so it needs the same Vault password, agent key and trusted host keys as a normal run.
+
+Each playbook is one play over `all` with `serial: 1` and without fact gathering, because no role uses facts. Every invocation loads `inventory/hosts.yml` together with the Vault-encrypted `inventory/group_vars/all/ssh_authorized_keys.yml`, so it needs the Vault password, also with `--check` and for roles that do not use the keys.
+
+Prerequisites on the host that no role installs: the CA bundle `/etc/ssl/certs/ca-certificates.crt` (`ca-certificates`) and the Debian archive keyring `/usr/share/keyrings/debian-archive-keyring.pgp` (`debian-archive-keyring`), which `apt_sources` checks before any change, and the time zone data `/usr/share/zoneinfo/Europe/Moscow` (`tzdata`), which `timezone` requires. For `--check`, also `python3-apt`: in check mode ansible-core's `apt` module fails without it; only a normal run installs it automatically.
+
+On the controller:
+
+- the collections (see [Collections](#collections));
+- the Vault password, because the inventory includes the encrypted `inventory/group_vars/all/ssh_authorized_keys.yml` (also for `--check`): the commands below use `--ask-vault-pass`; alternatively keep it in the git-ignored `.vault-password` in the repository root (mode `0600`) and pass `--vault-password-file .vault-password` instead;
+- an approved identity: a public key file whose key is in `ssh_authorized_keys_list`, with its private key loaded in `ssh-agent`. Ansible's own connection uses the same agent; the host must already accept one of the agent's keys for `root`;
+- trusted host keys in `~/.ssh/known_hosts` for the connection port and for `22334` (see "Host-key trust" under `sshd`). Nothing is learned on first use.
+
+Two different names identify the host. `--limit` takes the inventory hostname, the key under `hosts:` in `inventory/hosts.yml`. `known_hosts` uses the connection address, that host's `ansible_host`: `[address]:22334` for port `22334` and the bare `address` for port `22`. Set the variables in the shell that runs the commands:
+
+```sh
+inventory_host='<inventory-hostname>'
+```
+
+```sh
+address='<ansible_host>'
+```
+
+```sh
+proof_key="$HOME/.ssh/<approved-key>.pub"
+```
+
+Load the private key of the approved identity:
+
+```sh
+ssh-add "${proof_key%.pub}"
+```
+
+Confirm the trusted host keys; each lookup must print the expected keys:
+
+```sh
+ssh-keygen -F "[$address]:22334" -f "$HOME/.ssh/known_hosts"
+```
+
+```sh
+ssh-keygen -F "$address" -f "$HOME/.ssh/known_hosts"
+```
+
+The second lookup is needed only for a port-22 run.
+
+### `new_server.yml`
+
+Applies the 13 base roles in this order: `timezone`, `locale`, `hostname`, `apt_sources`, `chrony`, `dns_resolver` (installs `e2fsprogs`, which `hosts` needs), `hosts`, `admin_packages` (installs `iproute2`, whose `ss` `eternal_terminal` and `sshd` need, with the default package list), `ssh_authorized_keys`, `fail2ban`, `eternal_terminal`, `unattended_upgrades` and `sshd`. `sshd` is last because a successful port migration ends the play for that host. If a host fails, the run stops before the next host. Ingress and egress application configuration is not part of it.
+
+Only this playbook knows the role order. It maps inventory data and the results of earlier roles to role inputs; the check-mode inputs are `false` in a normal run:
+
+| Role input | Value in `new_server.yml` |
+| --- | --- |
+| `hosts_e2fsprogs_install_planned` | `ansible_check_mode and 'e2fsprogs' in dns_resolver_missing_at_start` |
+| `eternal_terminal_iproute2_install_planned` | `ansible_check_mode and 'iproute2' in admin_packages_planned` |
+| `sshd_iproute2_install_planned` | `ansible_check_mode and 'iproute2' in admin_packages_planned` |
+| `sshd_authorized_keys_change_planned` | `ansible_check_mode and ssh_authorized_keys_file_changed` |
+| `sshd_authorized_keys` | `ssh_authorized_keys_list`, the Vault list (`none` if undefined) |
+| `sshd_proof_identity` | `ssh_authorized_keys_proof_identity`, given with `-e` (`none` if undefined) |
+
+Run one host at a time: check and diff first, then apply. For a host that already accepts SSH on the inventory port `22334`, omit `-e ansible_port`. Check:
+
+```sh
+ansible-playbook new_server.yml \
+  --limit "$inventory_host" \
+  -e "ssh_authorized_keys_proof_identity=$proof_key" \
+  --ask-vault-pass --check --diff
+```
+
+Apply:
+
+```sh
+ansible-playbook new_server.yml \
+  --limit "$inventory_host" \
+  -e "ssh_authorized_keys_proof_identity=$proof_key" \
+  --ask-vault-pass
+```
+
+Supply `-e ansible_port=22` only for a host that still accepts SSH on port `22` and not yet on `22334`, before its first successful `sshd` run. The value overrides the inventory port for every host of the run, so always combine it with the single-host `--limit`. Check:
+
+```sh
+ansible-playbook new_server.yml \
+  --limit "$inventory_host" -e ansible_port=22 \
+  -e "ssh_authorized_keys_proof_identity=$proof_key" \
+  --ask-vault-pass --check --diff
+```
+
+Apply:
+
+```sh
+ansible-playbook new_server.yml \
+  --limit "$inventory_host" -e ansible_port=22 \
+  -e "ssh_authorized_keys_proof_identity=$proof_key" \
+  --ask-vault-pass
+```
+
+After the port-22 run has moved SSH to `22334`, port `22` is closed and the play has ended for that host. Every later run, check or apply, omits `-e ansible_port` and uses the inventory port `22334`.
+
+With `--check`, nothing is written and every role reports what it would do. On a fresh host some results are predictions: packages missing from the local APT indexes, the `i` flag of `/etc/hosts` before `e2fsprogs` is installed, the key file that `ssh_authorized_keys` would change and, while `iproute2` is planned but not installed, the listeners read by `sshd` and `eternal_terminal`. These are reported as deferred and checked by the normal run.
+
+### Standalone role playbooks
+
+`playbooks/<role_name>.yml` applies exactly one role with the same play settings, for example `playbooks/chrony.yml` or `playbooks/sshd.yml`. They find the roles in `roles/` through `roles_path` in the project `ansible.cfg`, so run them from the repository root like `new_server.yml`; a clean checkout needs nothing else. A standalone playbook never runs a second role to satisfy a prerequisite, and every check-mode input keeps its default `false`: the role checks the host as it is, also with `--check`. What another role would establish must already be in place:
+
+- `hosts` — `lsattr` and `chattr` (`e2fsprogs`);
+- `eternal_terminal` and `sshd` — `ss` (`iproute2`);
+- `sshd`, for a change — `/root/.ssh/authorized_keys` as a regular `root:root 0600` file with exactly the approved keys. `playbooks/sshd.yml` passes `ssh_authorized_keys_list` as `sshd_authorized_keys` and `ssh_authorized_keys_proof_identity` as `sshd_proof_identity`; it never writes the key file;
+- `apt_sources` and `timezone` — the host prerequisites above.
+
+Only `playbooks/ssh_authorized_keys.yml` and `playbooks/sshd.yml` use `ssh_authorized_keys_proof_identity`; leave it out for the other roles. The shell variables are those set above. Check one host with the standalone `sshd` playbook:
+
+```sh
+ansible-playbook playbooks/sshd.yml \
+  --limit "$inventory_host" \
+  -e "ssh_authorized_keys_proof_identity=$proof_key" \
+  --ask-vault-pass --check --diff
+```
+
+Apply:
+
+```sh
+ansible-playbook playbooks/sshd.yml \
+  --limit "$inventory_host" \
+  -e "ssh_authorized_keys_proof_identity=$proof_key" \
+  --ask-vault-pass
+```
+
+To bootstrap a host on port `22` with standalone playbooks, run `playbooks/ssh_authorized_keys.yml` and then `playbooks/sshd.yml`, each with `-e ansible_port=22` and the single-host `--limit`. Before the key file has been written, a standalone `--check` of `sshd` stops at the key-file check.
+
 ## Planned playbooks
 
 None of these playbooks exist yet:
 
-- `new_server.yml` — base OS configuration for all managed hosts.
 - A separate playbook for ingress nodes (name not yet chosen).
 - A separate playbook for egress nodes (name not yet chosen).
 

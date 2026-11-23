@@ -142,6 +142,30 @@ sshd_allowed_sockets:
   - sshd-vsock.socket
   - sshd-unix-local.socket
 
+# Approved keys (sshd_authorized_keys) and proof identity
+# (sshd_proof_identity). One plain public key line: a supported type, the
+# base64 key blob and an optional comment. Options, certificates, private
+# keys and multi-line values do not match.
+sshd_key_line_re: "^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)\
+  |sk-ssh-ed25519@openssh\\.com|sk-ecdsa-sha2-nistp256@openssh\\.com)\
+  [ \\t]+AAAA[A-Za-z0-9+/]+={0,2}([ \\t][^\\r\\n]*)?\\Z"
+# The key identity is the type and the key blob, without the comment.
+sshd_key_material_re: '^(\S+)\s+(\S+).*\Z'
+sshd_key_material_repl: '\1 \2'
+sshd_authorized_keys_path: /root/.ssh/authorized_keys
+# Derived from the inputs, templated lazily after validation. They hold key
+# material, so they are never printed.
+sshd_authorized_keys_desired: "{{ sshd_authorized_keys | join('\n') ~ '\n' }}"
+sshd_key_materials: >-
+  {{ sshd_authorized_keys
+     | map('regex_replace', sshd_key_material_re, sshd_key_material_repl)
+     | list }}
+sshd_proof_file: "{{ sshd_proof_identity | expanduser }}"
+sshd_proof_line: "{{ lookup('ansible.builtin.file', sshd_proof_file) }}"
+sshd_proof_material: >-
+  {{ sshd_proof_line
+     | regex_replace(sshd_key_material_re, sshd_key_material_repl) }}
+
 # Controller-side proofs. Fresh process, only the approved proof identity as
 # a raw public key, no multiplexing, no password or keyboard-interactive
 # fallback, ssh_config ignored, and strict host key checking against
@@ -158,7 +182,7 @@ sshd_probe_options:
   - -F
   - none
   - -i
-  - "{{ ssh_authorized_keys_proof_file }}"
+  - "{{ sshd_proof_file }}"
   - -o
   - User=root
   - -o
@@ -254,6 +278,18 @@ sshd_candidate_main_text: >-
         | map('regex_replace', '$', '"') | list
       + sshd_main_lines[sshd_main_first_line | int:])
      | join('\n') ~ '\n' }}
+# Check mode only: prerequisites that the caller says are established
+# before this role in a normal run (defaults/main.yml). A normal run always
+# checks the host as it is.
+# - the key file is changed to exactly sshd_authorized_keys;
+sshd_authorized_keys_deferred: >-
+  {{ ansible_check_mode and sshd_authorized_keys_change_planned | bool }}
+# - iproute2 is installed; ss is missing and iproute2 is not installed now.
+sshd_ss_deferred: >-
+  {{ ansible_check_mode
+     and sshd_iproute2_install_planned | bool
+     and not sshd_ss_stat.stat.exists
+     and sshd_iproute2_state.stdout is not match('ii') }}
 # Inputs of the listener and policy checks; tasks that check other output
 # override them with task vars.
 sshd_listen_text: "{{ sshd_current_listen.stdout }}"

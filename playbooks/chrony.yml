@@ -1,0 +1,8 @@
+---
+# Runs only the chrony role, one host at a time.
+- name: Apply the chrony role
+  hosts: all
+  serial: 1
+  gather_facts: false
+  roles:
+    - chrony

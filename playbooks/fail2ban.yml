@@ -1,0 +1,8 @@
+---
+# Runs only the fail2ban role, one host at a time.
+- name: Apply the fail2ban role
+  hosts: all
+  serial: 1
+  gather_facts: false
+  roles:
+    - fail2ban

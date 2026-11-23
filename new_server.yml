@@ -1,0 +1,45 @@
+---
+# Base configuration of a Debian 13 npv host. Ingress and egress application
+# configuration belongs to separate playbooks.
+#
+# One host at a time. No role reads gathered facts, so none are gathered.
+# Each role is independent; only this playbook knows their order and maps
+# the results of earlier roles to the optional check-mode inputs of later
+# ones. In a normal run those inputs are false.
+- name: Configure the base system
+  hosts: all
+  serial: 1
+  gather_facts: false
+  roles:
+    - timezone
+    - locale
+    - hostname
+    - apt_sources
+    - chrony
+    # Installs e2fsprogs (lsattr, chattr) when it is missing.
+    - dns_resolver
+    - role: hosts
+      vars:
+        hosts_e2fsprogs_install_planned: >-
+          {{ ansible_check_mode
+             and 'e2fsprogs' in dns_resolver_missing_at_start }}
+    # Installs iproute2 (ss) with the default package list.
+    - admin_packages
+    - ssh_authorized_keys
+    - fail2ban
+    - role: eternal_terminal
+      vars:
+        eternal_terminal_iproute2_install_planned: >-
+          {{ ansible_check_mode and 'iproute2' in admin_packages_planned }}
+    - unattended_upgrades
+    # Last: a port migration ends the play for this host. The approved keys
+    # and the proof identity are the inputs of ssh_authorized_keys.
+    - role: sshd
+      vars:
+        sshd_authorized_keys: "{{ ssh_authorized_keys_list | default(none) }}"
+        sshd_proof_identity: >-
+          {{ ssh_authorized_keys_proof_identity | default(none) }}
+        sshd_authorized_keys_change_planned: >-
+          {{ ansible_check_mode and ssh_authorized_keys_file_changed }}
+        sshd_iproute2_install_planned: >-
+          {{ ansible_check_mode and 'iproute2' in admin_packages_planned }}

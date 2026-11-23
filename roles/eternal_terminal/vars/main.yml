@@ -1,7 +1,7 @@
 ---
 # Internal constants of the eternal_terminal role.
 
-# ET transport port. SSH authentication stays on the sshd role's port 22334.
+# ET transport port. Sessions authenticate with SSH on port 22334.
 eternal_terminal_port: 20222
 
 # Architectures in the upstream trixie Release file.
@@ -106,11 +106,23 @@ eternal_terminal_failure: >-
   or 'no TCP port' }}. See journalctl -u et.service and
   {{ eternal_terminal_config }}.
 
+# Check mode only (defaults/main.yml): ss is missing, iproute2 is not
+# installed now, and the caller says that a normal run installs it before
+# this role. Only the listener observation is deferred then.
+eternal_terminal_ss_deferred: >-
+  {{ ansible_check_mode
+     and eternal_terminal_iproute2_install_planned | bool
+     and not eternal_terminal_ss_stat.stat.exists
+     and eternal_terminal_iproute2_state.stdout is not match('ii') }}
+
 # Restart a service that was running before this run if a setting changed
 # or if it does not own the port; a service started by this run already
-# reads both settings. At most one restart.
+# reads both settings. At most one restart. With the listener read deferred,
+# only a changed setting predicts a restart.
 eternal_terminal_restart: >-
   {{ eternal_terminal_start is not changed
-     and eternal_terminal_listen is not skipped
-     and (eternal_terminal_cfg is changed
-          or eternal_terminal_state != 'healthy') }}
+     and ((eternal_terminal_cfg is changed
+           and (eternal_terminal_listen is not skipped
+                or eternal_terminal_ss_deferred))
+          or (eternal_terminal_listen is not skipped
+              and eternal_terminal_state != 'healthy')) }}

@@ -1,0 +1,15 @@
+---
+# Runs only the sshd role, one host at a time. A port migration ends the
+# play for that host. The role reads /root/.ssh/authorized_keys but never
+# writes it; its approved keys and proof identity come from the inputs of
+# ssh_authorized_keys in the inventory and on the command line.
+- name: Apply the sshd role
+  hosts: all
+  serial: 1
+  gather_facts: false
+  roles:
+    - role: sshd
+      vars:
+        sshd_authorized_keys: "{{ ssh_authorized_keys_list | default(none) }}"
+        sshd_proof_identity: >-
+          {{ ssh_authorized_keys_proof_identity | default(none) }}

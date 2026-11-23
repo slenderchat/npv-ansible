@@ -1,0 +1,8 @@
+---
+# Runs only the ssh_authorized_keys role, one host at a time.
+- name: Apply the ssh_authorized_keys role
+  hosts: all
+  serial: 1
+  gather_facts: false
+  roles:
+    - ssh_authorized_keys
