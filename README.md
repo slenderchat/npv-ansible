@@ -20,6 +20,7 @@ This repository currently contains:
 - the `admin_packages` role: [`roles/admin_packages`](roles/admin_packages);
 - the `ssh_authorized_keys` role: [`roles/ssh_authorized_keys`](roles/ssh_authorized_keys);
 - the `sshd` role: [`roles/sshd`](roles/sshd);
+- the `fail2ban` role: [`roles/fail2ban`](roles/fail2ban);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -233,7 +234,7 @@ Check and diff: with `--check`, ownership and mode changes and the file rewrite 
 
 ### `sshd`
 
-Hardens the OpenSSH server and moves it to port `22334` with one drop-in, `/etc/ssh/sshd_config.d/00-npv-sshd.conf` (`root:root 0644`). Keys stay in the `ssh_authorized_keys` role; fail2ban, Eternal Terminal, the firewall and provider controls are not managed.
+Hardens the OpenSSH server and moves it to port `22334` with one drop-in, `/etc/ssh/sshd_config.d/00-npv-sshd.conf` (`root:root 0644`). Keys stay in the `ssh_authorized_keys` role and fail2ban in the `fail2ban` role; Eternal Terminal, the firewall and provider controls are not managed.
 
 Effective policy, checked with `sshd -T`:
 
@@ -304,6 +305,22 @@ Recovery. The timer is the recovery path until the cancel succeeds. If it fires 
 Check and diff: with `--check` on port 22 or 22334, the role performs the same read-only inspection and stops on the same blockers, shows the final drop-in as a diff (it contains no key material) and lists the planned steps. It writes nothing, arms no timer, reloads nothing and opens no proof connection; the login proofs, the `sshd -t -f`/`sshd -T -f` checks of the composed candidate, the reload, the command and SFTP proofs on 22334 and the listener verification are reported as deferred to a normal run.
 
 Limits: trust is read only from `~/.ssh/known_hosts`; `ansible_host` must be a host name or an IPv4 address; the proofs show that the proof identity works, not that every approved key does.
+
+### `fail2ban`
+
+Bans hosts that repeatedly fail SSH authentication from TCP port `22334`, the final SSH port of every managed host. The role installs `fail2ban` and `nftables` with recommendations disabled (the `systemd` backend uses `python3-systemd`, a hard dependency; the `nftables` action needs `nft`, which is only recommended), writes one file, `/etc/fail2ban/jail.d/npv-sshd.local` (`root:root 0644`), and enables and starts `fail2ban.service`.
+
+The file overrides only the `sshd` jail: `enabled = true`, `port = 22334`, `backend = systemd` and `banaction = nftables`. Everything else is inherited from Debian 13: the packaged `sshd` filter with Debian's `journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd` from `jail.d/defaults-debian.conf`, which replaces the filter's own match (the alternatives are combined with OR, so `sshd-session` messages are matched through the `ssh.service` unit, not by their process name), and `maxretry = 5`, `findtime = 10m` and `bantime = 10m`. There is no custom allowlist, all-ports ban or `recidive` jail; other jails and the vendor files are untouched. The action keeps the bans in its own `inet f2b-table` table; the host ruleset is not managed and `nftables.service` is not enabled.
+
+Before anything is written, `/etc/fail2ban/jail.d` must be a real directory and the managed file absent or a regular file, both inspected without following a final symlink; otherwise the role names the path and stops. The candidate file is tested with `fail2ban-client --test` in a temporary copy of `/etc/fail2ban` before it replaces the live file; in that copy an entry under the final name is removed, not written through.
+
+After the start, a normal run waits up to 10 s for `fail2ban-client ping` (the daemon only, not a jail) and reads the live jail once with `fail2ban-client get sshd action nftables port`. The service is reloaded, after `fail2ban-client --test` of the configuration on disk, if it was already running and the file changed, or if the live jail is missing or bans another port, for example because an earlier reload failed or never ran; a service started by the run already reads the file. After every reload the live port is read again and only that result counts; without a reload the first read counts. A failure shows the exit code and output and says whether the jail or action is missing or another `jail.d/*.local` or `jail.local` overrides the file. A converged run reports no change.
+
+Bootstrap. The port is fixed in the file and does not follow `ansible_port`. During a run with `-e ansible_port=22`, failures on port 22 are still counted, because the jail reads every `ssh.service` message, but a ban covers only `22334`, so it never blocks port 22 or that run's connection; it applies once `sshd` has moved SSH to `22334`.
+
+Eternal Terminal. Its sessions start with an SSH login on `22334`, so failed logins count and a banned address cannot start new sessions. Its own transport port is neither watched nor banned: the role adds no Eternal Terminal filter, and existing sessions on that port continue.
+
+Check and diff: with `--check` on a host with `fail2ban` installed, the path checks run, the file is shown as a diff and a start or reload is predicted; a running service's live jail is read (read-only) and a mismatch is shown as a predicted reload. Both `fail2ban-client --test` runs and the final live verification are reported as deferred. On a fresh host the packages are handled as for `chrony`; the file content, its test, the enabling and the start are reported as deferred, and no `fail2ban` command or unit is touched.
 
 ## Planned playbooks
 

@@ -1,0 +1,56 @@
+---
+# Internal constants of the fail2ban role.
+
+# The systemd backend needs python3-systemd, a hard dependency of fail2ban.
+# The nftables action needs nft, which fail2ban only recommends.
+fail2ban_packages: [fail2ban, nftables]
+
+# The only role-owned file. It holds the protected port, the final SSH port;
+# the expected live value is read from it, not repeated here.
+fail2ban_jail_dir: /etc/fail2ban/jail.d
+fail2ban_dropin_path: "{{ fail2ban_jail_dir }}/npv-sshd.local"
+fail2ban_ssh_port: >-
+  {{ lookup('ansible.builtin.file', 'npv-sshd.local')
+     | regex_search('(?m)^port = ([0-9]+)$', '\\1') | first }}
+
+# Native query of the running server: the port property of the action named
+# nftables (the banaction file name) in the jail sshd. Exit 255 if the server,
+# the jail or the action is missing.
+fail2ban_live_query: [fail2ban-client, get, sshd, action, nftables, port]
+
+# Tests the candidate inside a temporary copy of /etc/fail2ban, under its
+# final name, before it replaces the live file. cp -a keeps symlinks as
+# links, so every guard fails explicitly before the candidate path is used:
+# the copy's jail.d must be a real directory, and an entry under the final
+# name must be removable and gone. The copy module formats this string with
+# %s, so it must contain no other percent sign.
+fail2ban_validate: >-
+  /bin/sh -ec 'd=$(mktemp -d) || exit 1; trap "rm -rf \"$d\"" EXIT;
+  cp -a /etc/fail2ban/. "$d";
+  if [ -L "$d/jail.d" ] || [ ! -d "$d/jail.d" ];
+  then echo "jail.d is not a real directory" >&2; exit 1; fi;
+  f="$d/jail.d/{{ fail2ban_dropin_path | basename }}";
+  if [ -d "$f" ] && [ ! -L "$f" ];
+  then echo "the drop-in path is a directory" >&2; exit 1; fi;
+  rm -f "$f";
+  if [ -e "$f" ] || [ -L "$f" ];
+  then echo "the drop-in path could not be cleared" >&2; exit 1; fi;
+  cp "$1" "$f";
+  fail2ban-client --conf "$d" --test' fail2ban-validate %s
+
+# Live state: the port property of the running sshd jail's nftables action.
+fail2ban_live_ok: >-
+  {{ fail2ban_live.rc == 0
+     and fail2ban_live.stdout | trim == fail2ban_ssh_port }}
+# Reload a service that was running before this run if its drop-in changed,
+# and any service whose live jail or action is missing or has another port.
+fail2ban_reload_needed: >-
+  {{ (fail2ban_dropin is changed and fail2ban_start is not changed)
+     or not fail2ban_live_ok }}
+# The result that decides success: the post-reload read if a reload ran.
+fail2ban_result: >-
+  {{ fail2ban_final if fail2ban_final is defined
+     and fail2ban_final is not skipped else fail2ban_live }}
+fail2ban_result_ok: >-
+  {{ fail2ban_result.rc == 0
+     and fail2ban_result.stdout | trim == fail2ban_ssh_port }}

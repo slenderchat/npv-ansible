@@ -1,0 +1,9 @@
+# Managed by Ansible (role fail2ban); local changes are overwritten.
+# Read after jail.conf and jail.d/defaults-debian.conf. Only the port differs
+# from the Debian defaults; the packaged sshd filter, Debian's journalmatch,
+# maxretry, findtime and bantime are inherited.
+[sshd]
+enabled = true
+port = 22334
+backend = systemd
+banaction = nftables
