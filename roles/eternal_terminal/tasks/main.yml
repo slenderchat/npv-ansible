@@ -1,0 +1,173 @@
+---
+# Read-only, also in check mode: an unsupported host stops before any change.
+- name: Read the dpkg architecture
+  ansible.builtin.command:
+    argv: [dpkg, --print-architecture]
+  check_mode: false
+  changed_when: false
+  register: eternal_terminal_arch
+
+- name: Ensure the upstream repository publishes et for this architecture
+  ansible.builtin.assert:
+    that: eternal_terminal_arch.stdout in eternal_terminal_architectures
+    fail_msg: >-
+      The upstream trixie repository publishes et only for
+      {{ eternal_terminal_architectures | join(' and ') }}; this host is
+      {{ eternal_terminal_arch.stdout }}. Nothing was changed.
+    quiet: true
+
+# Keyring, preferences, then the source; the directories are shipped by apt.
+- name: Write the keyring, the package restriction and the source
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ eternal_terminal_apt_files }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  register: eternal_terminal_apt
+
+# Local metadata only; it never contacts a mirror.
+- name: Read the local APT metadata for et
+  ansible.builtin.command:
+    argv: [apt-cache, policy, et]
+  environment:
+    LC_ALL: C
+  check_mode: false
+  changed_when: false
+  register: eternal_terminal_policy
+
+# Error-Mode=any turns partial acquisition failures into a failed command.
+- name: Refresh the APT indexes
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv: [apt-get, -q, -o, APT::Update::Error-Mode=any, update]
+  environment:
+    LC_ALL: C
+  changed_when: true
+  when: eternal_terminal_refresh and not ansible_check_mode
+
+- name: Report that the APT indexes would be refreshed
+  ansible.builtin.debug:
+    msg: >-
+      The APT indexes would be refreshed
+      {{ 'after the repository change' if eternal_terminal_apt is changed
+         else 'because et has no candidate in the local indexes' }}.
+  changed_when: true
+  when: eternal_terminal_refresh and ansible_check_mode
+
+# policy-rc.d exit 101 makes the postinst skip its start of et.service, so
+# etserver never listens on the packaged port 2022; the postinst still
+# enables the unit. In check mode apt simulates a locally known package.
+- name: Install et
+  ansible.builtin.apt:
+    name: et
+    state: present
+    install_recommends: false
+    policy_rc_d: 101
+  when: not ansible_check_mode or eternal_terminal_known
+
+- name: Report the steps that need the repository index or the package
+  ansible.builtin.debug:
+    msg: >-
+      {{ '' if eternal_terminal_known else 'et is not in the local APT
+         indexes, so its transaction is unknown. ' }}A normal run would
+      install et without starting et.service, set in
+      {{ eternal_terminal_config }} [Networking] port =
+      {{ eternal_terminal_port }} (packaged 2022) and [Debug] telemetry =
+      false (packaged true), then enable and start et.service and verify
+      that etserver owns TCP {{ eternal_terminal_port }}. None of this was
+      checked now.
+  changed_when: true
+  when: ansible_check_mode and not eternal_terminal_installed
+
+# Only these options are managed; other settings and comments stay. Both are
+# written before the first start, and a change of either restarts at most
+# once.
+- name: Set the etserver port and disable server telemetry
+  community.general.ini_file:
+    path: "{{ eternal_terminal_config }}"
+    section: "{{ item.section }}"
+    option: "{{ item.option }}"
+    value: "{{ item.value }}"
+    create: false
+  loop: "{{ eternal_terminal_settings }}"
+  loop_control:
+    label: "[{{ item.section }}] {{ item.option }}"
+  register: eternal_terminal_cfg
+  when: not ansible_check_mode or eternal_terminal_installed
+
+- name: Enable et.service
+  ansible.builtin.systemd_service:
+    name: et.service
+    enabled: true
+  when: not ansible_check_mode or eternal_terminal_installed
+
+- name: Start et.service
+  ansible.builtin.systemd_service:
+    name: et.service
+    state: started
+  register: eternal_terminal_start
+  when: not ansible_check_mode or eternal_terminal_installed
+
+# The local socket table only; nothing connects to the listener. Read-only,
+# also in check mode, on a service that was already running. A service
+# started by this run gets up to 10 s to bind.
+- name: Read the TCP listeners
+  ansible.builtin.command:
+    argv: "{{ eternal_terminal_ss }}"
+  check_mode: false
+  changed_when: false
+  register: eternal_terminal_listen
+  until: >-
+    eternal_terminal_state != 'absent'
+    or eternal_terminal_start is not changed
+  retries: 10
+  delay: 1
+  when: >-
+    not ansible_check_mode
+    or (eternal_terminal_installed and eternal_terminal_start is not changed)
+
+# A restart cannot take a port that another process holds, and would stop
+# a running etserver on its old port.
+- name: Ensure no other process holds TCP {{ eternal_terminal_port }}
+  ansible.builtin.assert:
+    that: eternal_terminal_state != 'occupied'
+    fail_msg: "{{ eternal_terminal_failure }}"
+    quiet: true
+  when: eternal_terminal_listen is not skipped
+
+# Restarts a service that was running before this run if a setting changed,
+# or if it does not own the port, for example after an interrupted run that
+# wrote the file but did not restart. In check mode this is the prediction.
+- name: Restart et.service to apply the settings
+  ansible.builtin.systemd_service:
+    name: et.service
+    state: restarted
+  register: eternal_terminal_restarted
+  when: eternal_terminal_restart
+
+- name: Read the TCP listeners after the restart
+  ansible.builtin.command:
+    argv: "{{ eternal_terminal_ss }}"
+  changed_when: false
+  register: eternal_terminal_final
+  until: eternal_terminal_state != 'absent'
+  retries: 10
+  delay: 1
+  vars:
+    eternal_terminal_ss_text: "{{ eternal_terminal_final.stdout }}"
+  when: eternal_terminal_restarted is changed and not ansible_check_mode
+
+- name: Verify that etserver owns TCP {{ eternal_terminal_port }}
+  ansible.builtin.assert:
+    that: eternal_terminal_state == 'healthy'
+    fail_msg: "{{ eternal_terminal_failure }}"
+    quiet: true
+  vars:
+    eternal_terminal_ss_text: >-
+      {{ eternal_terminal_final.stdout
+         if eternal_terminal_final is not skipped
+         else eternal_terminal_listen.stdout }}
+  when: not ansible_check_mode

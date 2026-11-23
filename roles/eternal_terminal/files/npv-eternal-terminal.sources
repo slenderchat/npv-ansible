@@ -1,0 +1,9 @@
+# Managed by Ansible (role eternal_terminal); local changes are overwritten.
+# Upstream Eternal Terminal repository. Only the et package may be installed
+# from it: see /etc/apt/preferences.d/npv-eternal-terminal.pref.
+
+Types: deb
+URIs: https://mistertea.github.io/debian-et/debian-source
+Suites: trixie
+Components: main
+Signed-By: /etc/apt/keyrings/npv-eternal-terminal.asc
