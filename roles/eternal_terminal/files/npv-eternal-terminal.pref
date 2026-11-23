@@ -1,0 +1,13 @@
+# Managed by Ansible (role eternal_terminal); local changes are overwritten.
+# Only et may come from the upstream repository; its dependencies come from
+# the Debian sources. Its Release file has Origin and Label ". trixie" and
+# Codename trixie, and Debian's trixie shares that codename, so the records
+# select the repository by its host.
+
+Package: et
+Pin: origin mistertea.github.io
+Pin-Priority: 500
+
+Package: *
+Pin: origin mistertea.github.io
+Pin-Priority: -1

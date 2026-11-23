@@ -21,6 +21,7 @@ This repository currently contains:
 - the `ssh_authorized_keys` role: [`roles/ssh_authorized_keys`](roles/ssh_authorized_keys);
 - the `sshd` role: [`roles/sshd`](roles/sshd);
 - the `fail2ban` role: [`roles/fail2ban`](roles/fail2ban);
+- the `eternal_terminal` role: [`roles/eternal_terminal`](roles/eternal_terminal);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -318,9 +319,37 @@ After the start, a normal run waits up to 10 s for `fail2ban-client ping` (the d
 
 Bootstrap. The port is fixed in the file and does not follow `ansible_port`. During a run with `-e ansible_port=22`, failures on port 22 are still counted, because the jail reads every `ssh.service` message, but a ban covers only `22334`, so it never blocks port 22 or that run's connection; it applies once `sshd` has moved SSH to `22334`.
 
-Eternal Terminal. Its sessions start with an SSH login on `22334`, so failed logins count and a banned address cannot start new sessions. Its own transport port is neither watched nor banned: the role adds no Eternal Terminal filter, and existing sessions on that port continue.
+Eternal Terminal. Its sessions start with an SSH login on `22334`, so failed logins count and a banned address cannot start new sessions. Its own transport port, TCP `20222`, is neither watched nor banned: the role adds no Eternal Terminal filter, and existing sessions on that port continue.
 
 Check and diff: with `--check` on a host with `fail2ban` installed, the path checks run, the file is shown as a diff and a start or reload is predicted; a running service's live jail is read (read-only) and a mismatch is shown as a predicted reload. Both `fail2ban-client --test` runs and the final live verification are reported as deferred. On a fresh host the packages are handled as for `chrony`; the file content, its test, the enabling and the start are reported as deferred, and no `fail2ban` command or unit is touched.
+
+### `eternal_terminal`
+
+Installs the Eternal Terminal server from the upstream APT repository and runs `etserver` on TCP `20222` on every host. Sessions authenticate with SSH on `22334`; SSH, Fail2ban and the firewall stay with their roles, and SSH forwarding, SFTP and authorized keys are not touched.
+
+Files (`root:root 0644`); the source is written only after the keyring and the preferences file were both written successfully:
+
+- `/etc/apt/keyrings/npv-eternal-terminal.asc` — the upstream signing key, used only through `Signed-By`, never in global APT trust: RSA 2048, `Jason Gauci <jgmath2000@gmail.com>`, fingerprint `1B78 07C5 BEBF 69CB 10E6 6BD6 F965 0776 57E8 5C2D`. It is `et.gpg` from [MisterTea/debian-et](https://github.com/MisterTea/debian-et) (last changed in commit `7cade1271049`), ASCII-armored without other changes and kept in the role; it is not downloaded on the host and no upstream setup script runs;
+- `/etc/apt/preferences.d/npv-eternal-terminal.pref` — `Package: et` with priority 500 and every other package with priority -1 for `Pin: origin mistertea.github.io`. The upstream `Release` has `Origin` and `Label` `. trixie` and `Codename: trixie`, which Debian's archive shares, so the pin uses the host. Dependencies come from the Debian sources. `apt_sources` accepts this file, because an `origin` pin for another host cannot match `trixie-backports`;
+- `/etc/apt/sources.list.d/npv-eternal-terminal.sources` — `https://mistertea.github.io/debian-et/debian-source`, suite `trixie`, component `main`.
+
+The upstream repository publishes `et` for `amd64` and `arm64`; on any other `dpkg --print-architecture` the role stops before any change. If the files change or the local `apt-cache policy et` lists no version from the managed upstream index, for example after an interrupted run, the indexes are refreshed with `apt-get update` and `APT::Update::Error-Mode=any`; an installed version known only from the dpkg status or offered by another source does not count. Installed `et` is never upgraded (`state: present`). `et` is installed without recommended packages and with `policy_rc_d: 101` of `ansible.builtin.apt`: the package's postinst enables `et.service` and would start it on the packaged port `2022`; the temporary `policy-rc.d` blocks that start. The role then sets only `port = 20222` in `[Networking]` and `telemetry = false` in `[Debug]` of the conffile `/etc/et.cfg` (`community.general.ini_file`; packaged values `2022` and `true`); other settings and comments stay. etserver 7.1.1 reads both there, and the unit passes neither on the command line. On a first install both are written before `et.service` is enabled and started for the first time.
+
+Listener. The role reads the local socket table with `ss -Hltnp` and classifies TCP `20222`: owned only by `etserver` (healthy), held by another process, or free. A service started by the run gets up to 10 s to bind. A service that was already running is restarted once if a setting changed or if it does not own the port, for example when an interrupted run wrote `20222` but the old daemon still listens on `2022`. A healthy service with current settings is not restarted. If another process holds `20222`, the role names it and stops before any restart, because a restart cannot take the port and would stop etserver on its old port. After a restart the table is read again for up to 10 s. If etserver still does not own `20222` after a start or a restart, the run fails with the role's diagnostic and the ports etserver does listen on, taken from the last reading; if `ss` itself fails, its exit code and error are reported instead. Restarts: none on a first install (one start) and on a converged host; one when settings change on an existing installation or to repair the interrupted case above.
+
+TCP `20222` must be reachable from the client; the role opens no firewall or provider port and adds no source allowlist. The `fail2ban` role's `sshd` jail protects SSH on `22334`, which every session uses to start; `20222` is not watched.
+
+Updates. The role does not upgrade `et`. `apt-daily.timer` refreshes the upstream index, but the `unattended_upgrades` policy allows only `origin=Debian,codename=trixie-security,label=Debian-Security`, so `et` is never upgraded automatically. Upgrade it by hand with `apt-get install --only-upgrade et`; the package stops and starts `et.service`, and if a new release changes `/etc/et.cfg`, keep the local version.
+
+Client. Checked against the `et` 7.1.1 client source: `--ssh-option Port=22334` reaches the bootstrap `ssh` as `-o Port=22334`, `--port 20222` selects `etserver`, and `--telemetry=false` turns off the client's own error reporting, which defaults to `true` and is independent of the server's `[Debug] telemetry` above. In 7.1.1 `-p` is the SSH port, not the ET port; other client versions were not checked.
+
+```sh
+et --ssh-option Port=22334 --port 20222 --telemetry=false root@ingress-ru-tweb-msk1-01.sl-chat.ru
+```
+
+The bootstrap `ssh` reads `~/.ssh/config` and `known_hosts`, so the name must resolve and its host key under `[name]:22334` must be trusted.
+
+Check and diff: with `--check` the architecture check runs, the three files show content diffs and a needed refresh is reported, but no index is refreshed. If `et` is installed or has a candidate in the local indexes, apt simulates the installation. Without an installed `et`, the configuration, the unit and the listener cannot be observed: setting `port` to `20222` and `telemetry` to `false`, enabling, starting and the listener check are reported as deferred. On an installed host both settings show as a diff and a start is predicted for a stopped service. For a running service the socket table is read (read-only) and a restart is predicted if a setting changes or etserver does not own `20222`; another holder of the port stops the run as in a normal run. No service is started or restarted and nothing connects to the listener.
 
 ## Planned playbooks
 
