@@ -11,12 +11,6 @@
       bootstrap run. Nothing was changed.
     quiet: true
 
-# The approved key list, the proof identity contract and their parsing rules
-# belong to the ssh_authorized_keys role; they are loaded, not repeated.
-- name: Load the approved key contract of the ssh_authorized_keys role
-  ansible.builtin.include_vars:
-    file: "{{ role_path }}/../ssh_authorized_keys/vars/main.yml"
-
 # systemctl show exits 0 with LoadState=not-found for a missing unit.
 - name: Read the state of the SSH service
   ansible.builtin.command:  # noqa: command-instead-of-module
@@ -300,12 +294,46 @@
   changed_when: false
   register: sshd_current_effective
 
+# ss (package iproute2) reads the listeners here and in the final
+# verification of a change.
+- name: Look for ss
+  ansible.builtin.stat:
+    path: /usr/bin/ss
+    get_checksum: false
+  register: sshd_ss_stat
+
+# Exit status 1: dpkg does not know the package.
+- name: Read the installation state of iproute2
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, "--showformat=${db:Status-Abbrev}", iproute2]
+  check_mode: false
+  changed_when: false
+  failed_when: sshd_iproute2_state.rc not in [0, 1]
+  register: sshd_iproute2_state
+  when: not sshd_ss_stat.stat.exists
+
+# Only a check run with sshd_iproute2_install_planned may continue without
+# ss, and only while iproute2 is not installed.
+- name: Ensure ss is available
+  ansible.builtin.assert:
+    that: sshd_ss_deferred
+    fail_msg: >-
+      {{ '/usr/bin/ss is missing although iproute2 is installed; reinstall
+         iproute2 (apt-get install --reinstall iproute2).'
+         if sshd_iproute2_state.stdout is match('ii')
+         else 'This role reads the TCP listeners with ss from the iproute2
+         package, which is not installed; install iproute2 first.' }}
+      Nothing was changed.
+    quiet: true
+  when: not sshd_ss_stat.stat.exists
+
 - name: Read the listening TCP sockets
   ansible.builtin.command:
     argv: [ss, -H, -l, -t, -n, -p]
   check_mode: false
   changed_when: false
   register: sshd_current_listen
+  when: not sshd_ss_deferred
 
 # The connection port must be a port of this sshd; a port forwarded by NAT
 # or another daemon cannot be migrated safely.
@@ -317,15 +345,26 @@
         in sshd_current_effective.stdout
            | regex_findall(sshd_port_re) | map('split') | flatten
            | map('int') | list
-      - sshd_current_port | int in sshd_listeners_sshd
+      - sshd_ss_deferred or sshd_current_port | int in sshd_listeners_sshd
     fail_msg: >-
       Ansible connects on port {{ sshd_current_port }}, but sshd is configured
       for
       {{ sshd_current_effective.stdout | regex_findall(sshd_port_re)
          | join(', ') }} and listens on
-      {{ sshd_listeners_sshd | join(', ') or 'no TCP port' }}. Port
+      {{ 'unread ports (ss is not installed yet)' if sshd_ss_deferred
+         else sshd_listeners_sshd | join(', ') or 'no TCP port' }}. Port
       forwarding is not supported. Nothing was changed.
     quiet: true
+
+- name: Report the listener checks deferred until iproute2 is installed
+  ansible.builtin.debug:
+    msg: >-
+      ss is not installed yet, and sshd_iproute2_install_planned says that
+      iproute2 is installed before this role in a normal run. The TCP
+      listeners of sshd were not read, so neither the listener on port
+      {{ sshd_current_port }} nor a converged listener set was checked now;
+      a normal run checks both.
+  when: sshd_ss_deferred
 
 # Only a different drop-in text or a different connection port leads to a
 # change. Otherwise the host must already be in the final state; this path
@@ -340,11 +379,13 @@
   ansible.builtin.assert:
     that:
       - sshd_policy_errors == ''
-      - sshd_listeners_sshd == sshd_final_ports
+      - sshd_ss_deferred or sshd_listeners_sshd == sshd_final_ports
     fail_msg: >-
       The drop-in is current, but the host is not in the final state:
       effective mismatches: {{ sshd_policy_errors or 'none' }}; sshd listens
-      on TCP port(s) {{ sshd_listeners_sshd | join(', ') or 'none' }}
+      on TCP port(s)
+      {{ 'not read (ss is not installed yet)' if sshd_ss_deferred
+         else sshd_listeners_sshd | join(', ') or 'none' }}
       instead of {{ sshd_port }} only. Another configuration source
       overrides the drop-in, or the running sshd has not loaded it. Nothing
       was changed and sshd was not reloaded; check sshd -T and ss -ltnp.
@@ -357,22 +398,29 @@
     - name: Validate the approved keys and the proof identity
       ansible.builtin.assert:
         that:
-          - ssh_authorized_keys_list is defined
-          - ssh_authorized_keys_list is sequence
-          - ssh_authorized_keys_list is not string
-          - ssh_authorized_keys_list | length > 0
-          - ssh_authorized_keys_proof_identity is defined
-          - ssh_authorized_keys_proof_identity is string
-          - ssh_authorized_keys_proof_identity.endswith('.pub')
-          - ssh_authorized_keys_proof_file is file
-          - ssh_authorized_keys_proof_line is match(ssh_authorized_keys_line_re)
-          - ssh_authorized_keys_proof_material in ssh_authorized_keys_materials
+          - sshd_authorized_keys is defined
+          - sshd_authorized_keys is sequence
+          - sshd_authorized_keys is not string
+          - sshd_authorized_keys is not mapping
+          - sshd_authorized_keys | length > 0
+          - >-
+            sshd_authorized_keys | select('string')
+            | select('match', sshd_key_line_re) | list | length
+            == sshd_authorized_keys | length
+          - sshd_proof_identity is defined
+          - sshd_proof_identity is string
+          - sshd_proof_identity.endswith('.pub')
+          - sshd_proof_file is file
+          - sshd_proof_line is match(sshd_key_line_re)
+          - sshd_proof_material in sshd_key_materials
         fail_msg: >-
-          Changing sshd needs a login proof with the ssh_authorized_keys
-          contract: ssh_authorized_keys_list from the Vault file, and
-          ssh_authorized_keys_proof_identity set to a controller path of a
-          public key file (*.pub) whose key is in the list and whose private
-          key is loaded in ssh-agent. Nothing was changed.
+          Changing sshd needs a login proof. Set sshd_authorized_keys to the
+          nonempty list of approved plain public key lines (ssh-ed25519,
+          ssh-rsa, ecdsa-sha2-nistp256/384/521, sk-ssh-ed25519@openssh.com or
+          sk-ecdsa-sha2-nistp256@openssh.com; no options or certificates) and
+          sshd_proof_identity to a controller path of a public key file
+          (*.pub) whose key is in that list and whose private key is loaded
+          in ssh-agent. Nothing was changed.
         quiet: true
 
     # AllowUsers accumulates across files, so an entry elsewhere would
@@ -394,34 +442,49 @@
 
     - name: Inspect /root/.ssh/authorized_keys
       ansible.builtin.stat:
-        path: "{{ ssh_authorized_keys_path }}"
+        path: "{{ sshd_authorized_keys_path }}"
         follow: false
         get_checksum: false
       register: sshd_keys_stat
 
     - name: Read /root/.ssh/authorized_keys
       ansible.builtin.slurp:
-        src: "{{ ssh_authorized_keys_path }}"
+        src: "{{ sshd_authorized_keys_path }}"
       no_log: true
       register: sshd_keys_current
       when: sshd_keys_stat.stat.isreg | default(false)
 
     # sshd will read only this file, so it must already hold exactly the
-    # approved keys.
+    # approved keys; this role never writes it. Only a check run with
+    # sshd_authorized_keys_change_planned defers the comparison.
     - name: Ensure /root/.ssh/authorized_keys holds exactly the approved keys
       ansible.builtin.assert:
         that:
           - sshd_keys_stat.stat.isreg | default(false)
           - sshd_keys_stat.stat.uid == 0
+          - sshd_keys_stat.stat.gid == 0
           - sshd_keys_stat.stat.mode == '0600'
           - >-
             sshd_keys_current.content | b64decode
-            == ssh_authorized_keys_desired
+            == sshd_authorized_keys_desired
         fail_msg: >-
-          /root/.ssh/authorized_keys is missing, not root:root 0600 or not
-          exactly the approved key list. Run the ssh_authorized_keys role
-          before this role. Nothing was changed.
+          /root/.ssh/authorized_keys must be a regular file owned by
+          root:root with mode 0600 that holds exactly the lines of
+          sshd_authorized_keys, one per line, before sshd can change. This
+          role only reads the file; install exactly those keys there first.
+          Nothing was changed.
         quiet: true
+      when: not sshd_authorized_keys_deferred
+
+    - name: Report the key file check deferred to a normal run
+      ansible.builtin.debug:
+        msg: >-
+          sshd_authorized_keys_change_planned says that, before this role
+          in a normal run, /root/.ssh/authorized_keys is created, replaced or
+          corrected to root:root 0600 with exactly sshd_authorized_keys;
+          nothing was written in check mode. The file was not compared now;
+          a normal run requires it before any sshd change.
+      when: sshd_authorized_keys_deferred
 
     # Local and read-only: ssh-keygen -F prints the trusted entries for a
     # name, also hashed ones. Exit status 1 means no entry.

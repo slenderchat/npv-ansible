@@ -7,3 +7,9 @@
 #         - example-01.example.org
 #         - example-01
 hosts_extra_records: []
+
+# Check mode only; a normal run ignores it and requires lsattr and chattr.
+# Set it to true only when the same run, in a normal run, installs e2fsprogs
+# before this role. A check run on a host without e2fsprogs then reports the
+# immutable flag of /etc/hosts as unknown instead of failing.
+hosts_e2fsprogs_install_planned: false

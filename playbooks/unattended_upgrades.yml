@@ -1,0 +1,8 @@
+---
+# Runs only the unattended_upgrades role, one host at a time.
+- name: Apply the unattended_upgrades role
+  hosts: all
+  serial: 1
+  gather_facts: false
+  roles:
+    - unattended_upgrades

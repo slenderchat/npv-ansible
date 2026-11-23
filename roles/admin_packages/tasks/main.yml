@@ -53,3 +53,16 @@
           above leaves them out.
       changed_when: true
       when: ansible_check_mode and admin_packages_missing | length > 0
+
+# Result of this role: the requested packages that are not installed and
+# that a normal run installs. Only a check run can leave any; after a
+# normal run the list is empty.
+- name: Record the packages planned for installation
+  ansible.builtin.set_fact:
+    admin_packages_planned: >-
+      {{ admin_packages_policy.results
+         | rejectattr('stdout', 'search', '^ +Installed: [0-9]',
+                      multiline=True)
+         | map(attribute='item') | unique | list
+         if ansible_check_mode and admin_packages_list | length > 0
+         else [] }}

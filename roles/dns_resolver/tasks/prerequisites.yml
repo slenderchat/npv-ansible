@@ -12,6 +12,8 @@
   failed_when: dns_resolver_dpkg.rc not in [0, 1]
   register: dns_resolver_dpkg
 
+# Also the result of this role: the packages it found missing, which a
+# normal run installs (e2fsprogs first) and a check run only predicts.
 - name: Record the packages missing before this run
   ansible.builtin.set_fact:
     dns_resolver_missing_at_start: >-

@@ -15,6 +15,50 @@
     quiet: true
   when: hosts_stat.stat.exists
 
+# lsattr and chattr (package e2fsprogs) read and set the immutable flag.
+- name: Look for lsattr and chattr
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: [/usr/bin/lsattr, /usr/bin/chattr]
+  register: hosts_tools
+
+# Exit status 1: dpkg does not know the package.
+- name: Read the installation state of e2fsprogs
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, "--showformat=${db:Status-Abbrev}", e2fsprogs]
+  check_mode: false
+  changed_when: false
+  failed_when: hosts_e2fsprogs.rc not in [0, 1]
+  register: hosts_e2fsprogs
+  when: hosts_tools.results | rejectattr('stat.exists') | list | length > 0
+
+# Only a check run with hosts_e2fsprogs_install_planned may continue without
+# the tools, and only while e2fsprogs is not installed; the flag is then
+# unknown, never assumed clear.
+- name: Record whether the immutable flag is unknown in this check run
+  ansible.builtin.set_fact:
+    hosts_flag_unknown: >-
+      {{ hosts_e2fsprogs is not skipped
+         and ansible_check_mode
+         and hosts_e2fsprogs_install_planned | bool
+         and hosts_e2fsprogs.stdout is not match('ii') }}
+
+- name: Ensure lsattr and chattr are available
+  ansible.builtin.assert:
+    that: hosts_flag_unknown
+    fail_msg: >-
+      {{ hosts_tools.results | rejectattr('stat.exists')
+         | map(attribute='item') | join(' and ') }}
+      {{ 'missing although e2fsprogs is installed; reinstall e2fsprogs
+         (apt-get install --reinstall e2fsprogs).'
+         if hosts_e2fsprogs.stdout is match('ii')
+         else 'missing: install e2fsprogs, which provides lsattr and
+         chattr.' }}
+      Nothing was changed.
+    quiet: true
+  when: hosts_e2fsprogs is not skipped
+
 # lsattr is read-only, so it also runs in check mode. Its output is
 # "<flags> /etc/hosts"; flags are letters or "-" for inactive flags.
 - name: Read /etc/hosts attribute flags
@@ -25,12 +69,13 @@
     hosts_lsattr.rc | default(1) != 0
     or hosts_lsattr.stdout is not match('^[A-Za-z-]+[ ]+/etc/hosts$')
   register: hosts_lsattr
-  when: hosts_stat.stat.exists
+  when: hosts_stat.stat.exists and not hosts_flag_unknown
 
 - name: Record whether /etc/hosts is currently immutable
   ansible.builtin.set_fact:
     hosts_was_immutable: >-
-      {{ hosts_stat.stat.exists and 'i' in hosts_lsattr.stdout.split()[0] }}
+      {{ hosts_lsattr is not skipped
+         and 'i' in hosts_lsattr.stdout.split()[0] }}
 
 - name: Compare /etc/hosts with the template
   ansible.builtin.template:
@@ -108,7 +153,12 @@
 
 - name: Report that /etc/hosts would be made immutable
   ansible.builtin.debug:
-    msg: The immutable attribute would be set on /etc/hosts.
+    msg: >-
+      {{ 'The immutable flag of /etc/hosts is unknown because lsattr is not
+         installed yet; after e2fsprogs is installed it would be read and
+         set if missing.'
+         if hosts_stat.stat.exists and hosts_flag_unknown
+         else 'The immutable attribute would be set on /etc/hosts.' }}
   changed_when: true
   when: hosts_needs_lock and ansible_check_mode
 
