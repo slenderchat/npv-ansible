@@ -1,0 +1,474 @@
+---
+- name: Validate the connection and listener ports
+  ansible.builtin.assert:
+    that:
+      - ansible_port is defined
+      - ansible_port | string is match('^[0-9]{1,5}$')
+      - ansible_port | int >= 1 and ansible_port | int <= 65535
+    fail_msg: >-
+      ansible_port must be the TCP port on which Ansible reaches the host now:
+      the inventory default {{ sshd_port }}, or -e ansible_port=22 for a
+      bootstrap run. Nothing was changed.
+    quiet: true
+
+# The approved key list, the proof identity contract and their parsing rules
+# belong to the ssh_authorized_keys role; they are loaded, not repeated.
+- name: Load the approved key contract of the ssh_authorized_keys role
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../ssh_authorized_keys/vars/main.yml"
+
+# systemctl show exits 0 with LoadState=not-found for a missing unit.
+- name: Read the state of the SSH service
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState,ActiveState,UnitFileState,FragmentPath,ExecStart,Environment
+      - "{{ sshd_service }}"
+  check_mode: false
+  changed_when: false
+  register: sshd_unit_show
+
+- name: Read the state of ssh.socket
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState,ActiveState,UnitFileState
+      - ssh.socket
+  check_mode: false
+  changed_when: false
+  register: sshd_socket_show
+
+- name: List the active SSH socket units
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv:
+      - systemctl
+      - list-units
+      - --type=socket
+      - --state=active
+      - --plain
+      - --no-legend
+      - --no-pager
+      - ssh*
+  check_mode: false
+  changed_when: false
+  register: sshd_socket_list
+
+# Transient units of any operation, loaded or still running.
+- name: List the rollback units
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    argv:
+      - systemctl
+      - list-units
+      - --all
+      - --plain
+      - --no-legend
+      - --no-pager
+      - "{{ sshd_rollback_units }}"
+  check_mode: false
+  changed_when: false
+  register: sshd_rollback_show
+
+- name: Inspect the state of an earlier rollback
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - "{{ sshd_rollback_dir }}"
+    - "{{ sshd_rollback_token }}"
+  register: sshd_rollback_state
+
+# Remaining recovery state means that an earlier change has no known
+# outcome: its rollback failed, or the host rebooted or the run was lost
+# before the cancel.
+- name: Ensure no earlier sshd change is unfinished
+  ansible.builtin.assert:
+    that:
+      - sshd_rollback_show.stdout_lines | length == 0
+      - sshd_rollback_state.results | selectattr('stat.exists') | list
+        | length == 0
+    fail_msg: >-
+      An earlier sshd change is unfinished. Loaded rollback units:
+      {{ sshd_rollback_show.stdout_lines | map('split') | map('first')
+         | join(', ') or 'none' }}; existing:
+      {{ sshd_rollback_state.results | selectattr('stat.exists')
+         | map(attribute='item') | join(', ') or 'no rollback file' }}.
+      If a unit is loaded, wait until it has finished
+      (systemctl list-timers '{{ sshd_rollback_units }}'). Otherwise read the
+      owning operation in {{ sshd_rollback_dir }}/id and its result in
+      journalctl -u npv-sshd-rollback-<id>.service. Without
+      {{ sshd_rollback_dir }}/complete nothing was promoted: remove
+      {{ sshd_rollback_dir }} and {{ sshd_rollback_token }}. With it,
+      {{ sshd_rollback_dir }}/dropin is the previous drop-in
+      ({{ sshd_rollback_dir }}/absent: there was none). To restore it, copy
+      it with cp -p to {{ sshd_dropin_path }} (or remove that file), run
+      sshd -t and systemctl reload {{ sshd_service }}, and check a second
+      login. To keep the current drop-in, first check a login on every port
+      that sshd -T shows. Then remove {{ sshd_rollback_dir }},
+      {{ sshd_rollback_token }} and /etc/ssh/npv-sshd.candidate.*. Nothing
+      was changed.
+    quiet: true
+
+# Debian 13 starts sshd from ssh.service; ssh.socket is shipped disabled. A
+# socket unit would listen on ports that sshd_config does not control.
+- name: Ensure sshd runs from the packaged ssh.service only
+  ansible.builtin.assert:
+    that:
+      - sshd_unit.LoadState == 'loaded'
+      - sshd_unit.ActiveState == 'active'
+      - sshd_unit.UnitFileState == 'enabled'
+      - sshd_unit.FragmentPath == '/usr/lib/systemd/system/ssh.service'
+      - sshd_unit.ExecStart is match(sshd_exec_start_re)
+      - sshd_unit.ExecStart.count('{ path=') == 1
+      - sshd_unit.Environment is not search('SSHD_OPTS=')
+      - >-
+        sshd_socket_unit.LoadState in ['not-found', 'masked']
+        or (sshd_socket_unit.ActiveState != 'active'
+            and sshd_socket_unit.UnitFileState == 'disabled')
+      - >-
+        sshd_socket_list.stdout_lines | map('split') | map('first')
+        | difference(sshd_allowed_sockets) | length == 0
+    fail_msg: >-
+      Unsupported SSH service layout:
+      {{ sshd_service }} is {{ sshd_unit.LoadState | default('?') }}/{{
+      sshd_unit.ActiveState | default('?') }}/{{
+      sshd_unit.UnitFileState | default('?') }} from
+      {{ sshd_unit.FragmentPath | default('?') }}; ssh.socket is
+      {{ sshd_socket_unit.ActiveState | default('?') }}/{{
+      sshd_socket_unit.UnitFileState | default('?') }}; other active SSH
+      sockets:
+      {{ sshd_socket_list.stdout_lines | map('split') | map('first')
+         | difference(sshd_allowed_sockets) | join(', ') or 'none' }}.
+      The role requires the packaged unit, active and enabled, started as
+      "/usr/sbin/sshd -D $SSHD_OPTS" without an Environment override,
+      ssh.socket disabled and inactive (or masked) and no other TCP socket
+      for sshd. Nothing was changed.
+    quiet: true
+
+# SSHD_OPTS reaches the sshd command line from /etc/default/ssh. grep exits
+# 1 without a match and 2 if the optional file is missing.
+- name: Read SSHD_OPTS from /etc/default/ssh
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -E
+      - '^[[:space:]]*(export[[:space:]]+)?SSHD_OPTS[[:space:]]*='
+      - /etc/default/ssh
+  check_mode: false
+  changed_when: false
+  failed_when: sshd_default_opts.rc > 2
+  register: sshd_default_opts
+
+- name: Ensure SSHD_OPTS adds no command-line options
+  ansible.builtin.assert:
+    that:
+      - >-
+        sshd_default_opts.stdout_lines
+        | reject('match', sshd_default_opts_empty_re)
+        | list | length == 0
+    fail_msg: >-
+      /etc/default/ssh sets a non-empty SSHD_OPTS. Command-line options
+      override sshd_config and are not evaluated by this role; remove them
+      first. Nothing was changed.
+    quiet: true
+
+- name: Inspect the sshd configuration paths
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - "{{ sshd_main_config }}"
+    - "{{ sshd_dropin_dir }}"
+    - "{{ sshd_dropin_path }}"
+  register: sshd_paths
+
+- name: Ensure the configuration paths have the expected types
+  ansible.builtin.assert:
+    that:
+      - sshd_paths.results[0].stat.isreg | default(false)
+      - sshd_paths.results[1].stat.isdir | default(false)
+      - >-
+        not sshd_paths.results[2].stat.exists
+        or sshd_paths.results[2].stat.isreg
+    fail_msg: >-
+      {{ sshd_main_config }} must be a regular file, {{ sshd_dropin_dir }} a
+      directory and {{ sshd_dropin_path }} absent or a regular file, not a
+      symlink or another type. Nothing was changed.
+    quiet: true
+
+- name: Find the other sshd drop-ins
+  ansible.builtin.find:
+    paths: "{{ sshd_dropin_dir }}"
+    patterns: "*.conf"
+    file_type: any
+  register: sshd_dropin_find
+
+- name: Read the first directive of {{ sshd_main_config }}
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -n
+      - -m
+      - "1"
+      - -v
+      - -E
+      - '^[[:space:]]*(#|$)'
+      - "{{ sshd_main_config }}"
+  check_mode: false
+  changed_when: false
+  failed_when: sshd_first_directive.rc > 1
+  register: sshd_first_directive
+
+# Exit status 2 (for example a directory named *.conf) fails the task.
+- name: Read the listener and context directives of the other files
+  ansible.builtin.command:
+    argv: >-
+      {{ ['grep', '-H', '-n', '-i', '-E', sshd_directive_re, '--',
+          sshd_main_config]
+         + (sshd_dropin_find.files | map(attribute='path')
+            | reject('eq', sshd_dropin_path) | sort) }}
+  check_mode: false
+  changed_when: false
+  failed_when: sshd_directive_grep.rc > 1
+  register: sshd_directive_grep
+
+# sshd keeps the first value it reads for the managed keywords, also when it
+# re-reads the configuration for a Match block; Port and ListenAddress
+# accumulate.
+- name: Ensure the drop-in is read first and decides the managed keywords
+  ansible.builtin.assert:
+    that:
+      - sshd_main_first_text is match(sshd_include_re)
+      - >-
+        sshd_dropin_find.files | map(attribute='path') | map('basename')
+        | reject('eq', sshd_dropin_name)
+        | select('lt', sshd_dropin_name) | list | length == 0
+      - sshd_blocking_directives == ''
+    fail_msg: >-
+      Unsupported sshd configuration layout:
+      {% if sshd_main_first_text is not match(sshd_include_re) %}
+      the first directive of {{ sshd_main_config }} is not the Debian
+      "Include /etc/ssh/sshd_config.d/*.conf" (line
+      {{ sshd_main_first_line or 'none' }});
+      {% endif %}
+      {{ sshd_dropin_find.files | map(attribute='path') | map('basename')
+         | reject('eq', sshd_dropin_name) | select('lt', sshd_dropin_name)
+         | join(', ') or 'no drop-in' }} sorts before {{ sshd_dropin_name }};
+      directives: {{ sshd_blocking_directives or 'none' }}.
+      The role supports only the Debian layout, no further Include and no
+      Match block (Match settings override the drop-in for matching
+      connections), no ListenAddress and no Port other than {{ sshd_port }}
+      outside its drop-in. Move or remove these directives after checking
+      their purpose. Nothing was changed.
+    quiet: true
+
+- name: Read {{ sshd_main_config }}
+  ansible.builtin.slurp:
+    src: "{{ sshd_main_config }}"
+  register: sshd_main_current
+
+- name: Read the current drop-in
+  ansible.builtin.slurp:
+    src: "{{ sshd_dropin_path }}"
+  register: sshd_dropin_current
+  when: sshd_paths.results[2].stat.exists
+
+- name: Validate the current sshd configuration
+  ansible.builtin.command:
+    argv: ["{{ sshd_binary }}", -t]
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  register: sshd_current_test
+
+- name: Ensure the current configuration is valid
+  ansible.builtin.assert:
+    that: sshd_current_test.rc == 0
+    fail_msg: >-
+      sshd -t rejects the current configuration (rc
+      {{ sshd_current_test.rc }}): {{ sshd_current_test.stderr }}. A reload
+      would fail; fix it first. Nothing was changed.
+    quiet: true
+
+- name: Read the effective sshd configuration
+  ansible.builtin.command:
+    argv: ["{{ sshd_binary }}", -T]
+  check_mode: false
+  changed_when: false
+  register: sshd_current_effective
+
+- name: Read the listening TCP sockets
+  ansible.builtin.command:
+    argv: [ss, -H, -l, -t, -n, -p]
+  check_mode: false
+  changed_when: false
+  register: sshd_current_listen
+
+# The connection port must be a port of this sshd; a port forwarded by NAT
+# or another daemon cannot be migrated safely.
+- name: Ensure Ansible connects to an sshd listener
+  ansible.builtin.assert:
+    that:
+      - >-
+        sshd_current_port | int
+        in sshd_current_effective.stdout
+           | regex_findall(sshd_port_re) | map('split') | flatten
+           | map('int') | list
+      - sshd_current_port | int in sshd_listeners_sshd
+    fail_msg: >-
+      Ansible connects on port {{ sshd_current_port }}, but sshd is configured
+      for
+      {{ sshd_current_effective.stdout | regex_findall(sshd_port_re)
+         | join(', ') }} and listens on
+      {{ sshd_listeners_sshd | join(', ') or 'no TCP port' }}. Port
+      forwarding is not supported. Nothing was changed.
+    quiet: true
+
+# Only a different drop-in text or a different connection port leads to a
+# change. Otherwise the host must already be in the final state; this path
+# opens no proof connection and reloads nothing, and at most corrects the
+# drop-in's owner and mode (main.yml).
+- name: Record whether a change is needed
+  ansible.builtin.set_fact:
+    sshd_change_needed: >-
+      {{ sshd_dropin_text != sshd_final_text or sshd_migrating }}
+
+- name: Require the converged state when the drop-in is current
+  ansible.builtin.assert:
+    that:
+      - sshd_policy_errors == ''
+      - sshd_listeners_sshd == sshd_final_ports
+    fail_msg: >-
+      The drop-in is current, but the host is not in the final state:
+      effective mismatches: {{ sshd_policy_errors or 'none' }}; sshd listens
+      on TCP port(s) {{ sshd_listeners_sshd | join(', ') or 'none' }}
+      instead of {{ sshd_port }} only. Another configuration source
+      overrides the drop-in, or the running sshd has not loaded it. Nothing
+      was changed and sshd was not reloaded; check sshd -T and ss -ltnp.
+    quiet: true
+  when: not sshd_change_needed
+
+- name: Validate the prerequisites of a change
+  when: sshd_change_needed
+  block:
+    - name: Validate the approved keys and the proof identity
+      ansible.builtin.assert:
+        that:
+          - ssh_authorized_keys_list is defined
+          - ssh_authorized_keys_list is sequence
+          - ssh_authorized_keys_list is not string
+          - ssh_authorized_keys_list | length > 0
+          - ssh_authorized_keys_proof_identity is defined
+          - ssh_authorized_keys_proof_identity is string
+          - ssh_authorized_keys_proof_identity.endswith('.pub')
+          - ssh_authorized_keys_proof_file is file
+          - ssh_authorized_keys_proof_line is match(ssh_authorized_keys_line_re)
+          - ssh_authorized_keys_proof_material in ssh_authorized_keys_materials
+        fail_msg: >-
+          Changing sshd needs a login proof with the ssh_authorized_keys
+          contract: ssh_authorized_keys_list from the Vault file, and
+          ssh_authorized_keys_proof_identity set to a controller path of a
+          public key file (*.pub) whose key is in the list and whose private
+          key is loaded in ssh-agent. Nothing was changed.
+        quiet: true
+
+    # AllowUsers accumulates across files, so an entry elsewhere would
+    # survive any drop-in.
+    - name: Ensure no other source allows a user other than root
+      ansible.builtin.assert:
+        that: sshd_current_users | reject('eq', 'root') | list | length == 0
+        fail_msg: >-
+          The current configuration allows
+          {{ sshd_current_users | reject('eq', 'root') | join(', ') }}
+          through AllowUsers. AllowUsers values from all files add up, so the
+          drop-in cannot remove them; remove that AllowUsers entry first.
+          Nothing was changed.
+        quiet: true
+      vars:
+        sshd_current_users: >-
+          {{ sshd_current_effective.stdout | regex_findall(sshd_allowusers_re)
+             | map('split') | flatten | list }}
+
+    - name: Inspect /root/.ssh/authorized_keys
+      ansible.builtin.stat:
+        path: "{{ ssh_authorized_keys_path }}"
+        follow: false
+        get_checksum: false
+      register: sshd_keys_stat
+
+    - name: Read /root/.ssh/authorized_keys
+      ansible.builtin.slurp:
+        src: "{{ ssh_authorized_keys_path }}"
+      no_log: true
+      register: sshd_keys_current
+      when: sshd_keys_stat.stat.isreg | default(false)
+
+    # sshd will read only this file, so it must already hold exactly the
+    # approved keys.
+    - name: Ensure /root/.ssh/authorized_keys holds exactly the approved keys
+      ansible.builtin.assert:
+        that:
+          - sshd_keys_stat.stat.isreg | default(false)
+          - sshd_keys_stat.stat.uid == 0
+          - sshd_keys_stat.stat.mode == '0600'
+          - >-
+            sshd_keys_current.content | b64decode
+            == ssh_authorized_keys_desired
+        fail_msg: >-
+          /root/.ssh/authorized_keys is missing, not root:root 0600 or not
+          exactly the approved key list. Run the ssh_authorized_keys role
+          before this role. Nothing was changed.
+        quiet: true
+
+    # Local and read-only: ssh-keygen -F prints the trusted entries for a
+    # name, also hashed ones. Exit status 1 means no entry.
+    - name: Read the trusted host keys for both ports on the controller
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -F
+          - "{{ item }}"
+          - -f
+          - "{{ sshd_known_hosts_file }}"
+      loop:
+        - "{{ sshd_probe_host if sshd_current_port | int == 22
+              else '[' ~ sshd_probe_host ~ ']:' ~ sshd_current_port }}"
+        - "[{{ sshd_probe_host }}]:{{ sshd_port }}"
+      delegate_to: localhost
+      check_mode: false
+      changed_when: false
+      failed_when: sshd_trust.rc > 1
+      no_log: true
+      register: sshd_trust
+      when: sshd_migrating
+
+    # The new port must be trusted with exactly the host keys already trusted
+    # for the current port, so that the proofs and every later connection
+    # check the same identity; nothing is learned on first use.
+    - name: Ensure the final port is trusted with the same host keys
+      ansible.builtin.assert:
+        that:
+          - sshd_trust_keys[0] | length > 0
+          - sshd_trust_keys[0] == sshd_trust_keys[1]
+          - sshd_trust.results | map(attribute='stdout')
+            | select('search', '(?m)^@') | list | length == 0
+        fail_msg: >-
+          {{ sshd_known_hosts_file }} must trust the name
+          [{{ sshd_probe_host }}]:{{ sshd_port }} with exactly the host keys
+          already trusted for
+          {{ sshd_probe_host if sshd_current_port | int == 22
+             else '[' ~ sshd_probe_host ~ ']:' ~ sshd_current_port }}
+          ({{ sshd_trust_keys[0] | length }} key(s) for the current port,
+          {{ sshd_trust_keys[1] | length }} for the new one), without
+          @cert-authority or @revoked markers. See "Host-key trust" in
+          README.md. Nothing was changed.
+        quiet: true
+      vars:
+        sshd_trust_keys: >-
+          {{ sshd_trust.results | map(attribute='stdout')
+             | map('regex_findall', sshd_known_hosts_key_re)
+             | map('unique') | map('sort') | list }}
+      when: sshd_migrating

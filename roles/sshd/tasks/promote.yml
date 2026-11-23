@@ -1,0 +1,67 @@
+---
+# Validates a candidate drop-in as part of the composed configuration, then
+# moves it into place and reloads sshd under the rollback lock. Until the
+# move, the live drop-in and the running sshd are unchanged.
+# Input: sshd_candidate_text, sshd_expected_ports.
+
+- name: Write the candidate drop-in outside sshd_config.d
+  ansible.builtin.copy:
+    content: "{{ sshd_candidate_text }}"
+    dest: "{{ sshd_candidate_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Write the composed main configuration for the candidate
+  ansible.builtin.copy:
+    content: "{{ sshd_candidate_main_text }}"
+    dest: "{{ sshd_candidate_main }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Validate the composed candidate with sshd -t
+  ansible.builtin.command:
+    argv: ["{{ sshd_binary }}", -t, -f, "{{ sshd_candidate_main }}"]
+  changed_when: false
+  failed_when: false
+  register: sshd_new_test
+
+- name: Read the composed candidate with sshd -T
+  ansible.builtin.command:
+    argv: ["{{ sshd_binary }}", -T, -f, "{{ sshd_candidate_main }}"]
+  changed_when: false
+  failed_when: false
+  register: sshd_new_effective
+
+- name: Require the composed candidate to enforce the policy
+  ansible.builtin.assert:
+    that:
+      - sshd_new_test.rc == 0
+      - sshd_new_effective.rc == 0
+      - sshd_policy_errors == ''
+    fail_msg: >-
+      The candidate is not accepted; the live drop-in was not changed:
+      sshd -t rc {{ sshd_new_test.rc }}{{ (' (' ~ sshd_new_test.stderr ~ ')')
+                                          if sshd_new_test.stderr else '' }};
+      effective mismatches: {{ sshd_policy_errors or 'none' }}.
+    quiet: true
+  vars:
+    sshd_effective_text: "{{ sshd_new_effective.stdout }}"
+
+- name: Remove the composed candidate configuration
+  ansible.builtin.file:
+    path: "{{ sshd_candidate_main }}"
+    state: absent
+
+# Under the lock, the token must still hold this operation's ID; then the
+# rename moves this operation's candidate only. The rename is atomic within
+# /etc and keeps the candidate's root:root 0644. ExecReload runs sshd -t
+# on the live configuration, then SIGHUP: the listener re-executes and open
+# sessions continue. This is the last task: when it closes the current port, no
+# further task may use the Ansible connection. If it fails, sshd was not
+# reloaded, so the current port is still open.
+- name: Promote the candidate and reload sshd under the rollback lock
+  ansible.builtin.command:
+    argv: "{{ sshd_locked + [sshd_promote_script] }}"
+  changed_when: true

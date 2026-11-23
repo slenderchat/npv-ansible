@@ -19,6 +19,7 @@ This repository currently contains:
 - the `unattended_upgrades` role: [`roles/unattended_upgrades`](roles/unattended_upgrades);
 - the `admin_packages` role: [`roles/admin_packages`](roles/admin_packages);
 - the `ssh_authorized_keys` role: [`roles/ssh_authorized_keys`](roles/ssh_authorized_keys);
+- the `sshd` role: [`roles/sshd`](roles/sshd);
 - the collection requirements: [`collections/requirements.yml`](collections/requirements.yml).
 
 Host groups:
@@ -229,6 +230,80 @@ First run: the role does not change ports. If a host still accepts SSH only on i
 Limits: the proof shows that root can log in with the proof identity at that moment, not that sshd reads this file (`AuthorizedKeysFile`, `AuthorizedKeysCommand`) or that the other keys work. The final file is not proven again after it is written, and a change made by another process between the read and the write is overwritten.
 
 Check and diff: with `--check`, ownership and mode changes and the file rewrite are predicted; nothing is appended and no proof is attempted. Key material, comments and file contents are never shown, also with `--diff`; a message reports the number of keys to add and remove, the entries with options to replace, whether only comments or order change, and whether a proof is required.
+
+### `sshd`
+
+Hardens the OpenSSH server and moves it to port `22334` with one drop-in, `/etc/ssh/sshd_config.d/00-npv-sshd.conf` (`root:root 0644`). Keys stay in the `ssh_authorized_keys` role; fail2ban, Eternal Terminal, the firewall and provider controls are not managed.
+
+Effective policy, checked with `sshd -T`:
+
+- listener `Port 22334` only;
+- only `root` (`AllowUsers root`, `PermitRootLogin prohibit-password`), with `AuthenticationMethods publickey` and plain keys from `/root/.ssh/authorized_keys` only: `AuthorizedKeysFile /root/.ssh/authorized_keys` (Debian's default also reads `authorized_keys2`), `AuthorizedKeysCommand none`, `TrustedUserCAKeys none`, and the certificate algorithms removed from the default `PubkeyAcceptedAlgorithms`; password, keyboard-interactive and host-based authentication are off;
+- `DisableForwarding yes` (agent, X11, TCP and Unix socket forwarding) and `PermitTunnel no`;
+- shells, PTYs (`PermitTTY yes`), commands and SFTP stay available: `ForceCommand none` and `ChrootDirectory none`, and Debian's `Subsystem sftp /usr/lib/openssh/sftp-server` in `/etc/ssh/sshd_config` is kept and required. Ansible keeps its normal command execution and file transfer; the inventory transfer method is unchanged;
+- `UsePAM yes` keeps Debian's PAM account and session handling; all other settings, including the cryptographic defaults, stay as packaged.
+
+Debian's `/etc/ssh/sshd_config` starts with `Include /etc/ssh/sshd_config.d/*.conf`, and the drop-in sorts first. For most of these keywords sshd keeps the first value it reads, so later files and the rest of `sshd_config` cannot change them; a `Match` block could, which is why `Match` is rejected. `AllowUsers` and `Port` are different: their values from all files add up. The role therefore compares the complete effective sets from `sshd -T`, every line and every value on a line, and requires the users to be exactly `root` and the ports exactly `22334` (both ports during the migration). Another file's `Port` other than `22334`, `ListenAddress` or `AllowUsers` entry for another user stops the role.
+
+Supported layout, checked before any change (also with `--check`). Each blocker stops the host with the reason and the file and line where applicable; nothing is changed:
+
+- the packaged `ssh.service` (the Debian 13 default) is active and enabled, starts `/usr/sbin/sshd -D $SSHD_OPTS`, and neither `/etc/default/ssh` nor a unit `Environment=` sets `SSHD_OPTS`; `ssh.socket` is disabled and inactive or masked; no other SSH socket unit is active except `sshd-vsock.socket` and `sshd-unix-local.socket` of systemd's ssh generator, which serve AF_VSOCK and a local AF_UNIX socket through `sshd@.service` with the same configuration;
+- the first directive of `/etc/ssh/sshd_config` is that `Include`; no other drop-in sorts before `00-npv-sshd.conf`; outside the drop-in there is no other `Include`, no `Match` block (its settings would override the drop-in for matching connections), no `ListenAddress` and no `Port` other than `22334` (a `Port 22334` elsewhere is accepted and not repeated);
+- `sshd -t` accepts the current configuration, and the port Ansible uses is a configured and listening sshd port (port forwarding is not supported);
+- no earlier change is unfinished: no loaded `npv-sshd-rollback*` unit, no `/etc/ssh/npv-sshd.rollback` and no `/run/npv-sshd-rollback.armed`.
+
+Provider bootstrap. Without any `Port` line, sshd's implicit default 22 is replaced by the drop-in's `Port 22` and `Port 22334` and then by `Port 22334` alone. An explicit `Port 22` in another file, for example a provider's drop-in or `sshd_config`, cannot be removed by the drop-in, so the role stops at "Ensure the drop-in is read first and decides the managed keywords" with the file and line; it never edits that file. To continue, keep the current session on port 22 open, comment out only that `Port 22` line (no other `Port` or `ListenAddress` must remain), check that `sshd -t` succeeds and that `sshd -T` still prints `port 22` (now the default), and open a second login on port 22 before closing the first; the running sshd is not affected until a reload. Then run the bootstrap. A `Port 22334` set by hand elsewhere is accepted as is.
+
+SFTP. The role requires a `Subsystem sftp` line in the effective configuration and proves it with an SFTP login; Debian's external `/usr/lib/openssh/sftp-server` and `internal-sftp` are both accepted.
+
+For a change, additionally:
+
+- `ssh_authorized_keys_list` and `ssh_authorized_keys_proof_identity` as in the `ssh_authorized_keys` role (the role loads that role's contract); the proof key is approved and loaded in `ssh-agent`;
+- `/root/.ssh/authorized_keys` is a `root`-owned regular file with mode `0600` that holds exactly the approved keys. Role order: run `ssh_authorized_keys` before `sshd`, in the same play and with the same proof identity;
+- for a port change, the host-key trust below;
+- `ss` (iproute2) and `systemd-run` on the host, and `ssh`, `sftp` and `ssh-keygen` on the controller.
+
+Controller proofs. Every proof is a new `ssh` or `sftp` process on the controller with `-F none`, only the proof identity as a raw public key (certificate algorithms removed), `User=root`, `BatchMode`, no connection sharing (`ControlMaster=no`, `ControlPath=none`), no password or keyboard-interactive fallback, `StrictHostKeyChecking=yes` and `UpdateHostKeys=no` against `~/.ssh/known_hosts` only. It never uses Ansible's connection or an existing master connection. The SFTP proof runs the read-only batch command `ls /`, which uploads and creates nothing. Results are reduced to the host, port, exit code and whether the success marker matched; raw output and key material are not shown.
+
+Host-key trust. A connection to a port other than 22 looks up `[address]:port` in `known_hosts`. Before a port change the role requires that `~/.ssh/known_hosts` trusts `[address]:22334` with exactly the host keys trusted for the current name (`address` for port 22), without `@cert-authority` or `@revoked` markers. Nothing is learned on first use and `ssh-keyscan` is not used. After the fingerprint for port 22 has been verified, copy the trusted entries under the new name:
+
+```sh
+host=46.149.69.224
+ssh-keygen -F "$host" -f ~/.ssh/known_hosts
+ssh-keygen -F "$host" -f ~/.ssh/known_hosts \
+  | awk -v name="[$host]:22334" '!/^[#@]/ { $1 = name; print }' \
+  >> ~/.ssh/known_hosts
+```
+
+The same entry lets the next Ansible run on port `22334` verify the host.
+
+Bootstrap of a fresh host reachable on port 22, one host at a time. The repository has no playbook yet; use a play of your own that applies `ssh_authorized_keys` and then `sshd`, with `sshd` last:
+
+```sh
+ansible-playbook -i inventory/hosts.yml <your-play>.yml --limit <host> \
+  -e ansible_port=22 \
+  -e ssh_authorized_keys_proof_identity=~/.ssh/id_ed25519.pub \
+  --ask-vault-pass
+```
+
+`-e ansible_port=22` is the current connection port; the listener port is always `22334`. Steps and the port that stays usable:
+
+1. Fresh login proof on 22. Nothing has changed; on failure the run stops.
+2. The run draws a unique operation ID. Under the lock `/run/npv-sshd-rollback.lock` it creates `/etc/ssh/npv-sshd.rollback/` (which fails if it already exists) and writes `id` (the owner), then `dropin` (a copy of the current drop-in) or `absent` (there was none), then `complete`, and finally the token `/run/npv-sshd-rollback.armed` with the same ID. Then the transient `npv-sshd-rollback-<ID>.timer` is armed for 600 s. Arming, every promotion, the cancel and the rollback run under that lock and act only if `id`, and for a promotion or cancel also the token, hold their own ID. The rollback removes the token first, restores `dropin` (or removes the drop-in if `absent` exists), reloads sshd, and only then stops its timer and removes `id` and the directory. If the restore or the reload fails, `id` and the snapshot stay and the same operation can retry; without `complete` nothing was promoted, so it only discards the state. Controller commands wait up to 60 s for the lock; the timer's rollback waits without a limit.
+3. The candidate with `Port 22` and `Port 22334` and the full policy is written to `/etc/ssh/npv-sshd.candidate.<ID>.conf`, outside `sshd_config.d`. A composed main file, `sshd_config` with its first `Include` replaced by the candidate followed by the other drop-ins in glob order, is checked with `sshd -t -f` and `sshd -T -f`. Only then is this operation's candidate renamed over the live drop-in and `ssh.service` reloaded, in one command that fails unless the token holds this operation's ID. Ports 22 and 22334 are open with the new policy; existing sessions continue.
+4. A root command and SFTP are proved on 22334. If this fails, for example because the provider blocks 22334, this operation's rollback runs at once over the still open port 22, which also stops its timer after a successful restore, and the run fails, naming the step. Port 22 works as before.
+5. The final candidate (`Port 22334` only) is validated and promoted the same way; the reload runs over the current connection and closes 22. A root command and SFTP are proved on 22334 again.
+6. Over fresh connections to 22334: `sshd -T` must show the policy and only port 22334, `ss` must show sshd listening only on TCP 22334 and nothing on 22. Then the cancel, only if the token and `id` still hold this operation's ID, removes the token, `id` and the directory and stops this operation's timer; otherwise it fails, because a rollback has started or the host has rebooted and the verified state may no longer be live. If a step after 5 fails, the run reports where it stopped; the timer restores the previous configuration and reopens 22 600 s after it was armed. Do not rerun before `/etc/ssh/npv-sshd.rollback` is gone.
+
+After the final promotion, every task (proofs, final verification, cancel) runs on the controller with `delegate_to: localhost` and connects with `ssh -p 22334` or `sftp -P 22334`, so `-e ansible_port=22` does not affect it. After step 6 the role reports the migration and ends the play for that host (`meta: end_host`): `-e ansible_port=22` has the highest variable precedence, so the run cannot switch to 22334, and no task may reconnect to the closed port. Later roles of the play are skipped for the host, and later plays of the same invocation would try port 22. The next invocation, without `-e ansible_port`, uses the inventory port `22334`.
+
+Normal use on 22334. On a host already reached on 22334, for example one configured by hand, the role applies the policy directly: proof on 22334, timer, drop-in, checks, reload, command and SFTP proofs, final verification and cancellation, all on 22334; port 22 is never opened. Any failure, including in the final verification, runs the rollback at once over the Ansible connection; if that is not possible, the timer does. When the drop-in text is already current, the run opens no proof connection and does not reload; it only sets the drop-in to `root:root 0644` if its owner, group or mode differ (also predicted with `--check`), and it succeeds only if `sshd -T` shows the policy with exactly `root` and port `22334` and `ss` shows sshd listening on TCP 22334 only; otherwise it fails with the mismatch.
+
+Recovery. The timer is the recovery path until the cancel succeeds. If it fires while the run is still working, its rollback waits for the lock, so a promotion that is reloading sshd finishes first; it then removes the token, so the next promotion of that run fails without changing the drop-in and the cancel fails: the run never reports success for a state the rollback may have replaced. A stale run, timer or rescue cannot act on a later operation, because every action checks its own ID under the lock and the candidate and timer carry the ID. If the controller is lost after the final reload, the live sshd listens on 22334 only, and the timer restores the previous drop-in and reopens 22 600 s after it was armed (`systemctl list-timers 'npv-sshd-rollback*'`). Restoration is delayed while another holder keeps the lock (at most a `systemctl reload`), and prevented by a reboot, a stopped timer or a failed reload; the result is in `journalctl -u npv-sshd-rollback-<ID>.service`. A reboot removes the timer and the token. A candidate that has not been promoted is not read by sshd, so the host boots with the previous drop-in. A promoted drop-in was validated in the composed configuration, but its login may not have been proved yet, and nothing rolls it back after a reboot. `/etc/ssh/npv-sshd.rollback` remains and stops the next run with these instructions: without `complete`, nothing was promoted, so remove the directory and the token; otherwise either restore `dropin` with `cp -p` (or remove the drop-in if `absent` exists), run `sshd -t` and `systemctl reload ssh` and check a second login, or keep the current drop-in after checking a login on every port that `sshd -T` shows; then remove the directory, the token and `/etc/ssh/npv-sshd.candidate.*`. Console access through the provider remains the last resort and is outside this role.
+
+Check and diff: with `--check` on port 22 or 22334, the role performs the same read-only inspection and stops on the same blockers, shows the final drop-in as a diff (it contains no key material) and lists the planned steps. It writes nothing, arms no timer, reloads nothing and opens no proof connection; the login proofs, the `sshd -t -f`/`sshd -T -f` checks of the composed candidate, the reload, the command and SFTP proofs on 22334 and the listener verification are reported as deferred to a normal run.
+
+Limits: trust is read only from `~/.ssh/known_hosts`; `ansible_host` must be a host name or an IPv4 address; the proofs show that the proof identity works, not that every approved key does.
 
 ## Planned playbooks
 

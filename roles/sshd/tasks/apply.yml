@@ -1,0 +1,225 @@
+---
+# Order, with the port that stays usable at each step (P is the current
+# port, ansible_port; N is sshd_port):
+#  1. fresh login proof on P; nothing changed yet;
+#  2. operation ID drawn; recovery state, token and timer created; P
+#     unchanged;
+#  3. candidate with P and N validated in the composed configuration, then
+#     promoted and sshd reloaded under the lock; P and N open, both with the
+#     new policy;
+#  4. root command and SFTP proved on N from the controller;
+#  5. when P differs from N: final candidate validated, promoted and
+#     reloaded, which closes P; root command and SFTP proved on N again;
+#  6. effective configuration and listeners verified over a fresh connection
+#     to N; the operation is cancelled over another one.
+# A failure while P is open runs this operation's rollback at once over P;
+# after the final promotion, only its timer restores the previous drop-in
+# and reopens P. Every task after the final promotion runs on the controller
+# (delegate_to: localhost) and reaches N with -p, so -e ansible_port does
+# not matter there.
+
+- name: Prove a fresh root login on the current port before any change
+  ansible.builtin.include_tasks: probe.yml
+  vars:
+    sshd_probe_port: "{{ sshd_current_port }}"
+    sshd_probe_purpose: Login proof before the change
+    sshd_probe_sftp: false
+
+# Unique per run; it names the recovery state, token, timer and candidate
+# files that this run may act on (vars/main.yml).
+- name: Draw the operation ID and record the stage
+  ansible.builtin.set_fact:
+    sshd_op_id: >-
+      {{ now(utc=true, fmt='%Y%m%d%H%M%S') }}-{{
+         lookup('ansible.builtin.password', '/dev/null',
+                chars=['ascii_lowercase', 'digits'], length=16) }}
+    sshd_stage: arming
+
+- name: Change sshd with the rollback timer armed
+  block:
+    # mkdir fails if any recovery state exists, so arming never touches
+    # another operation's state.
+    - name: Create the recovery state and token of this operation
+      ansible.builtin.command:
+        argv: "{{ sshd_locked + [sshd_arm_script] }}"
+      changed_when: true
+
+    # A transient timer and oneshot service; nothing is installed. The timer
+    # unloads after it fires. The service waits for the lock without a
+    # limit and has no start timeout.
+    - name: Arm the rollback timer
+      ansible.builtin.command:
+        argv: >-
+          {{ ['systemd-run', '--unit=' ~ sshd_rollback_unit,
+              '--description=Roll back an unfinished sshd change',
+              '--service-type=oneshot', '--collect',
+              '--property=TimeoutStartSec=infinity',
+              '--on-active=' ~ sshd_rollback_delay,
+              '--timer-property=AccuracySec=1s',
+              '--timer-property=RemainAfterElapse=no', '--']
+             + sshd_locked_timer + [sshd_rollback_script] }}
+      changed_when: true
+
+    - name: Record the stage
+      ansible.builtin.set_fact:
+        sshd_stage: armed
+        sshd_armed_at: "{{ now(utc=true, fmt='%H:%M:%S UTC') }}"
+
+    - name: Validate and promote the drop-in with the current and final port
+      ansible.builtin.include_tasks: promote.yml
+      vars:
+        sshd_candidate_text: "{{ sshd_stage_text }}"
+        sshd_expected_ports: "{{ sshd_stage_ports }}"
+
+    - name: Record the stage
+      ansible.builtin.set_fact:
+        sshd_stage: stage-promoted
+
+    - name: Prove the final port with the new policy
+      ansible.builtin.include_tasks: probe.yml
+      vars:
+        sshd_probe_port: "{{ sshd_port }}"
+        sshd_probe_purpose: >-
+          Proof of port {{ sshd_port }} while port {{ sshd_current_port }} is
+          open
+        sshd_probe_sftp: true
+
+    - name: Close the current port
+      when: sshd_migrating
+      block:
+        - name: Record the stage
+          ansible.builtin.set_fact:
+            sshd_stage: final-validated
+
+        # The promotion runs over the current connection while P is still
+        # open; the session survives the reload. No later task connects to
+        # the host through Ansible.
+        - name: Validate and promote the final drop-in
+          ansible.builtin.include_tasks: promote.yml
+          vars:
+            sshd_candidate_text: "{{ sshd_final_text }}"
+            sshd_expected_ports: "{{ sshd_final_ports }}"
+
+        - name: Record the stage
+          ansible.builtin.set_fact:
+            sshd_stage: final-promoted
+
+        - name: Prove the final port after closing the current port
+          ansible.builtin.include_tasks: probe.yml
+          vars:
+            sshd_probe_port: "{{ sshd_port }}"
+            sshd_probe_purpose: >-
+              Proof of port {{ sshd_port }} after closing port
+              {{ sshd_current_port }}
+            sshd_probe_sftp: true
+
+    - name: Read the final state over a fresh connection
+      ansible.builtin.include_tasks: probe.yml
+      vars:
+        sshd_probe_port: "{{ sshd_port }}"
+        sshd_probe_purpose: Final verification
+        sshd_probe_sftp: false
+        sshd_probe_command: >-
+          {{ sshd_binary }} -T && echo '#listen' && ss -H -l -t -n -p
+          && printf %s {{ sshd_probe_marker }}
+
+    - name: Require the final configuration and listeners
+      ansible.builtin.assert:
+        that:
+          - sshd_policy_errors == ''
+          - sshd_listeners_sshd == sshd_final_ports
+          - >-
+            not sshd_migrating
+            or sshd_current_port | int not in sshd_listeners_all
+        fail_msg: >-
+          Final verification over port {{ sshd_port }} failed: effective
+          mismatches: {{ sshd_policy_errors or 'none' }}; sshd listens on TCP
+          port(s) {{ sshd_listeners_sshd | join(', ') or 'none' }};
+          {{ ('port ' ~ sshd_current_port ~ ' is '
+              ~ ('still' if sshd_current_port | int in sshd_listeners_all
+                 else 'not') ~ ' listening')
+             if sshd_migrating else 'no port change' }}.
+        quiet: true
+      vars:
+        sshd_probe_parts: "{{ sshd_probe.stdout.split('\n#listen\n', 1) }}"
+        sshd_effective_text: "{{ sshd_probe_parts[0] }}"
+        sshd_listen_text: "{{ sshd_probe_parts[1] | default('') }}"
+
+    # Succeeds only while this operation is armed: then no rollback of it
+    # has started, its recovery state is released, and the verified state
+    # is the live one.
+    - name: Cancel the rollback over a fresh connection
+      ansible.builtin.include_tasks: probe.yml
+      vars:
+        sshd_probe_port: "{{ sshd_port }}"
+        sshd_probe_purpose: >-
+          Cancelling operation {{ sshd_op_id }} (a failure means that its
+          rollback has started, the host has rebooted or the lock was busy;
+          {{ sshd_rollback_dir }} remains until the outcome is known)
+        sshd_probe_sftp: false
+        sshd_probe_command: "{{ sshd_cancel_command }}"
+
+    - name: Record the stage
+      ansible.builtin.set_fact:
+        sshd_stage: done
+
+  rescue:
+    - name: Keep the error
+      ansible.builtin.set_fact:
+        sshd_error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+        sshd_port_open: >-
+          {{ sshd_stage in ['arming', 'armed', 'stage-promoted',
+                            'final-validated'] }}
+
+    # P is still open. The same script as the timer's, for this operation
+    # only, under the controller's lock wait. It also stops this
+    # operation's timer, but only after a complete restore and reload;
+    # otherwise the timer stays as a retry.
+    - name: Run this operation's rollback now while the current port is open
+      ansible.builtin.command:
+        argv: "{{ sshd_locked + [sshd_rollback_script] }}"
+      changed_when: true
+      failed_when: false
+      register: sshd_restore
+      when: sshd_port_open
+
+    - name: Report where the change stopped
+      ansible.builtin.fail:
+        msg: >-
+          The sshd change on {{ inventory_hostname }} (operation
+          {{ sshd_op_id | default('none') }}) stopped after this step:
+          {{ sshd_stage_names[sshd_stage] }}. Error: {{ sshd_error }}
+          {% if sshd_stage == 'stage-promoted' %}
+          If the controller cannot reach port {{ sshd_port }} (for example,
+          the provider blocks it), allow it and run again.
+          {% endif %}
+          {% if not sshd_port_open %}
+          Port {{ sshd_current_port }} may be closed. Unless this operation
+          was already rolled back or cancelled, its timer
+          {{ sshd_rollback_unit }}.timer, armed at {{ sshd_armed_at }},
+          restores the previous drop-in and reloads sshd
+          {{ sshd_rollback_delay }} s after that time, which reopens port
+          {{ sshd_current_port }} with the previous policy; port
+          {{ sshd_port }} was usable when last proved. Do not rerun before
+          {{ sshd_rollback_dir }} is gone.
+          {% elif sshd_restore.rc | default(-1) == 0
+                  and sshd_restore.stdout is search('restored$') %}
+          The rollback has restored the previous drop-in and reloaded sshd;
+          port {{ sshd_current_port }} is usable as before.
+          {% elif sshd_restore.rc | default(-1) == 0 %}
+          Arming was interrupted before the snapshot was complete, so the
+          drop-in was never changed; the partial recovery state was removed.
+          {% elif sshd_restore.rc | default(-1) == 4 %}
+          This operation owns no recovery state, so nothing was restored
+          now: its timer may already have run (journalctl -u
+          {{ sshd_rollback_unit }}.service), or another operation owns
+          {{ sshd_rollback_dir }}. Check the host before rerunning.
+          {% else %}
+          The immediate rollback did not complete (rc
+          {{ sshd_restore.rc | default('?') }}). The recovery state of this
+          operation, if it was created, is kept in {{ sshd_rollback_dir }};
+          if {{ sshd_rollback_unit }}.timer is still loaded, it retries
+          {{ sshd_rollback_delay }} s after
+          {{ sshd_armed_at | default('arming') }}.
+          Port {{ sshd_current_port }} was open at this step.
+          {% endif %}

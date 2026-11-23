@@ -1,0 +1,327 @@
+---
+# The final listener. Ansible reaches the host on ansible_port (inventory
+# default 22334, or -e ansible_port=22 for a bootstrap run); both are
+# compared on every run.
+sshd_port: 22334
+
+sshd_binary: /usr/sbin/sshd
+sshd_service: ssh.service
+sshd_main_config: /etc/ssh/sshd_config
+sshd_dropin_dir: /etc/ssh/sshd_config.d
+# Named to sort before every other drop-in, so that its values come first.
+# For most managed keywords sshd keeps the first value it reads; AllowUsers
+# and Port accumulate across files, so their complete effective sets are
+# compared (sshd_policy_errors).
+sshd_dropin_name: 00-npv-sshd.conf
+sshd_dropin_path: "{{ sshd_dropin_dir }}/{{ sshd_dropin_name }}"
+# The Debian layout this role supports: this line is the first directive of
+# /etc/ssh/sshd_config.
+sshd_include_re: "(?i)^\\s*Include(\\s*=\\s*|\\s+)\
+  /etc/ssh/sshd_config\\.d/\\*\\.conf\\s*$"
+# Directives in the other configuration files that decide listeners or
+# whether the drop-in can win.
+sshd_directive_re: "^[[:space:]]*(Include|Match|Port|ListenAddress)\
+  ([[:space:]]|=)"
+sshd_directive_parse_re: "(?mi)^([^:\\n]+):([0-9]+):\\s*\
+  (include|match|port|listenaddress)(?:\\s*=\\s*|\\s+)(.*?)\\s*$"
+
+# Rollback ("dead man's switch"), owned by one operation. Every change run
+# draws a unique operation ID (sshd_op_id, set in apply.yml). Under the
+# lock, arming creates the recovery directory exclusively (mkdir) and
+# writes, in this order:
+#   id        the owning operation ID;
+#   dropin    a copy of the previous drop-in, or
+#   absent    an empty marker if there was no drop-in;
+#   complete  the snapshot is usable (written after sync);
+# and then the token in /run with the same ID. Only then is the transient
+# timer npv-sshd-rollback-<ID> started.
+# - id is ownership: only the operation named there restores, releases or
+#   removes the recovery state, and removing id releases it.
+# - The token means "armed, no rollback started, no reboot since": every
+#   promotion and the cancel require it to hold their own ID. The rollback
+#   removes it first, so its operation can no longer promote or cancel.
+# - Without complete, no token was written, nothing was promoted and the
+#   live drop-in is unchanged; the rollback then only discards the state.
+# The rollback removes id and the directory only after the restore and the
+# reload succeeded. If either fails, everything else stays, so the same
+# operation (its timer, if still loaded) or an operator can retry.
+sshd_rollback_unit: npv-sshd-rollback-{{ sshd_op_id }}
+sshd_rollback_units: npv-sshd-rollback*
+sshd_rollback_dir: /etc/ssh/npv-sshd.rollback
+sshd_rollback_token: /run/npv-sshd-rollback.armed
+sshd_rollback_lock: /run/npv-sshd-rollback.lock
+sshd_rollback_delay: 600
+# Controller-side holders wait at most 60 s, then fail without a change. The
+# timer's rollback waits without a limit: every holder is a short command,
+# the longest being systemctl reload during a promotion or rollback.
+sshd_locked: [/usr/bin/flock, -w, "60", "{{ sshd_rollback_lock }}", /bin/sh, -c]
+sshd_locked_timer: [/usr/bin/flock, "{{ sshd_rollback_lock }}", /bin/sh, -c]
+# Prints "unchanged" (interrupted arm, nothing to restore) or "restored";
+# exit 4: this operation owns no recovery state; 5: the snapshot is damaged.
+# No $ or %: systemd-run passes it to the service unchanged.
+sshd_rollback_script: >-
+  rm -f {{ sshd_candidate_path }} {{ sshd_candidate_main }};
+  grep -qsxF {{ sshd_op_id }} {{ sshd_rollback_dir }}/id
+  || { echo 'operation {{ sshd_op_id }} owns no rollback state' >&2; exit 4; };
+  rm -f {{ sshd_rollback_token }};
+  if [ ! -e {{ sshd_rollback_dir }}/complete ];
+  then rm -f {{ sshd_rollback_dir }}/id && rm -rf {{ sshd_rollback_dir }}
+  && echo unchanged; exit;
+  fi;
+  if [ -f {{ sshd_rollback_dir }}/dropin ];
+  then cp -p {{ sshd_rollback_dir }}/dropin {{ sshd_rollback_dir }}/restore.tmp
+  && mv -f {{ sshd_rollback_dir }}/restore.tmp {{ sshd_dropin_path }};
+  elif [ -e {{ sshd_rollback_dir }}/absent ];
+  then rm -f {{ sshd_dropin_path }};
+  else echo 'the rollback snapshot is damaged' >&2; exit 5;
+  fi
+  && systemctl reload {{ sshd_service }}
+  && { systemctl stop {{ sshd_rollback_unit }}.timer || true; }
+  && rm -f {{ sshd_rollback_dir }}/id && rm -rf {{ sshd_rollback_dir }}
+  && echo restored
+sshd_arm_script: >-
+  mkdir -m 0700 {{ sshd_rollback_dir }}
+  && echo {{ sshd_op_id }} > {{ sshd_rollback_dir }}/id
+  && if [ ! -e {{ sshd_dropin_path }} ] && [ ! -L {{ sshd_dropin_path }} ];
+  then touch {{ sshd_rollback_dir }}/absent;
+  elif [ -f {{ sshd_dropin_path }} ] && [ ! -L {{ sshd_dropin_path }} ];
+  then cp -p {{ sshd_dropin_path }} {{ sshd_rollback_dir }}/dropin;
+  else echo 'the drop-in is not a regular file' >&2; false;
+  fi
+  && sync && touch {{ sshd_rollback_dir }}/complete && sync
+  && echo {{ sshd_op_id }} > {{ sshd_rollback_token }}
+# Moves this operation's validated candidate into place and reloads, only
+# while this operation is armed.
+sshd_promote_script: >-
+  grep -qsxF {{ sshd_op_id }} {{ sshd_rollback_token }}
+  || { echo 'operation {{ sshd_op_id }} is no longer armed' >&2; exit 3; };
+  mv -f {{ sshd_candidate_path }} {{ sshd_dropin_path }}
+  && systemctl reload {{ sshd_service }}
+# Runs as a remote shell command over a fresh connection to sshd_port.
+# Succeeds only while this operation is armed; removing id first means that
+# a rollback of this operation that waits for the lock finds nothing to do.
+sshd_cancel_command: >-
+  {{ sshd_locked[:5] | join(' ') }} -c
+  'grep -qsxF {{ sshd_op_id }} {{ sshd_rollback_token }}
+  && grep -qsxF {{ sshd_op_id }} {{ sshd_rollback_dir }}/id
+  && rm -f {{ sshd_rollback_token }} {{ sshd_rollback_dir }}/id
+  && rm -rf {{ sshd_rollback_dir }}
+  && { systemctl stop {{ sshd_rollback_unit }}.timer || true; }'
+  && printf %s {{ sshd_probe_marker }}
+
+# The candidate is validated as part of the composed configuration before it
+# replaces the live drop-in. Neither path is read by the live sshd. Both
+# carry the operation ID, so the final rename can only move this
+# operation's validated candidate.
+sshd_candidate_path: /etc/ssh/npv-sshd.candidate.{{ sshd_op_id }}.conf
+sshd_candidate_main: /etc/ssh/npv-sshd.candidate.{{ sshd_op_id }}.main
+
+# Effective policy as printed by sshd -T: keyword -> accepted values. Each
+# keyword must appear exactly once with one of these values. AllowUsers and
+# Port are compared as complete collections in sshd_policy_errors.
+sshd_policy:
+  permitrootlogin: [without-password, prohibit-password]
+  authenticationmethods: [publickey]
+  pubkeyauthentication: ["yes"]
+  passwordauthentication: ["no"]
+  kbdinteractiveauthentication: ["no"]
+  hostbasedauthentication: ["no"]
+  authorizedkeysfile: [/root/.ssh/authorized_keys]
+  authorizedkeyscommand: [none]
+  trustedusercakeys: [none]
+  disableforwarding: ["yes"]
+  permittunnel: ["no"]
+  permittty: ["yes"]
+  forcecommand: [none]
+  chrootdirectory: [none]
+  usepam: ["yes"]
+
+# Socket units of the systemd ssh generator that run sshd@.service with the
+# same configuration on non-IP transports (AF_VSOCK, local AF_UNIX).
+sshd_allowed_sockets:
+  - sshd-vsock.socket
+  - sshd-unix-local.socket
+
+# Controller-side proofs. Fresh process, only the approved proof identity as
+# a raw public key, no multiplexing, no password or keyboard-interactive
+# fallback, ssh_config ignored, and strict host key checking against
+# ~/.ssh/known_hosts only, which is never updated.
+sshd_known_hosts_file: "{{ '~/.ssh/known_hosts' | expanduser }}"
+sshd_probe_host: "{{ ansible_host | default(inventory_hostname) }}"
+sshd_probe_marker: npv-sshd-proof
+sshd_probe_options:
+  - -F
+  - none
+  - -i
+  - "{{ ssh_authorized_keys_proof_file }}"
+  - -o
+  - User=root
+  - -o
+  - BatchMode=yes
+  - -o
+  - StrictHostKeyChecking=yes
+  - -o
+  - UpdateHostKeys=no
+  - -o
+  - UserKnownHostsFile={{ sshd_known_hosts_file }}
+  - -o
+  - GlobalKnownHostsFile=/dev/null
+  - -o
+  - ControlMaster=no
+  - -o
+  - ControlPath=none
+  - -o
+  - PreferredAuthentications=publickey
+  - -o
+  - PasswordAuthentication=no
+  - -o
+  - KbdInteractiveAuthentication=no
+  - -o
+  - IdentitiesOnly=yes
+  - -o
+  - PubkeyAcceptedAlgorithms=-*-cert-v01@openssh.com
+  - -o
+  - ConnectTimeout=30
+  - -o
+  - ServerAliveInterval=10
+  - -o
+  - ServerAliveCountMax=3
+# A read-only request: lists / and creates or uploads nothing.
+sshd_sftp_batch: "ls /\n"
+
+# Derived values, templated lazily after the inspection.
+sshd_current_port: "{{ ansible_port | int }}"
+sshd_migrating: "{{ sshd_current_port | int != sshd_port }}"
+sshd_unit: >-
+  {{ dict(sshd_unit_show.stdout | regex_findall(sshd_unit_property_re)) }}
+sshd_socket_unit: >-
+  {{ dict(sshd_socket_show.stdout | regex_findall(sshd_unit_property_re)) }}
+sshd_main_first_line: "{{ sshd_first_directive.stdout.split(':', 1)[0] }}"
+sshd_main_first_text: >-
+  {{ sshd_first_directive.stdout.split(':', 1)[1] | default('') }}
+# (file, line, keyword, value) for each Include, Match, Port and ListenAddress
+# outside the role's drop-in.
+sshd_directives: >-
+  {{ sshd_directive_grep.stdout | regex_findall(sshd_directive_parse_re) }}
+# Everything except the standard Include on the first directive line of the
+# main file and Port sshd_port.
+sshd_blocking_directives: >-
+  {%- set out = [] -%}
+  {%- for path, line, key, value in sshd_directives -%}
+  {%- if not (path == sshd_main_config and line == sshd_main_first_line
+              and key | lower == 'include')
+         and not (key | lower == 'port' and value == sshd_port | string) -%}
+  {%- set _ = out.append(path ~ ':' ~ line ~ ' ' ~ key ~ ' ' ~ value) -%}
+  {%- endif -%}
+  {%- endfor -%}
+  {{ out | join('; ') }}
+# A Port sshd_port in another file already provides the final listener; the
+# drop-in then does not repeat it.
+sshd_foreign_port: >-
+  {{ sshd_directives | selectattr('2', 'match', '(?i)port$')
+     | selectattr('3', 'eq', sshd_port | string) | list | length > 0 }}
+sshd_final_ports: "{{ [sshd_port] }}"
+sshd_stage_ports: "{{ [sshd_current_port | int, sshd_port] | unique }}"
+sshd_foreign_render: "{{ [sshd_port] if sshd_foreign_port else [] }}"
+sshd_final_text: >-
+  {{ lookup('ansible.builtin.template', 'npv-sshd.conf.j2',
+            template_vars={'sshd_render_ports': sshd_final_ports
+                           | difference(sshd_foreign_render)}) }}
+sshd_stage_text: >-
+  {{ lookup('ansible.builtin.template', 'npv-sshd.conf.j2',
+            template_vars={'sshd_render_ports': sshd_stage_ports
+                           | difference(sshd_foreign_render)}) }}
+sshd_dropin_text: >-
+  {{ sshd_dropin_current.content | b64decode
+     if sshd_dropin_current is not skipped else '' }}
+sshd_other_dropins: >-
+  {{ sshd_dropin_find.files | map(attribute='path')
+     | reject('eq', sshd_dropin_path) | sort }}
+# The live main configuration with its first directive, the Debian Include,
+# replaced by explicit Includes in glob order: the candidate in place of the
+# role's drop-in, then every other drop-in. sshd -t -f and sshd -T -f on it
+# show the configuration that the live layout yields after promotion.
+sshd_main_lines: "{{ (sshd_main_current.content | b64decode).splitlines() }}"
+sshd_candidate_main_text: >-
+  {{ (sshd_main_lines[:sshd_main_first_line | int - 1]
+      + ['Include "' ~ sshd_candidate_path ~ '"']
+      + sshd_other_dropins | map('regex_replace', '^', 'Include "')
+        | map('regex_replace', '$', '"') | list
+      + sshd_main_lines[sshd_main_first_line | int:])
+     | join('\n') ~ '\n' }}
+# Inputs of the listener and policy checks; tasks that check other output
+# override them with task vars.
+sshd_listen_text: "{{ sshd_current_listen.stdout }}"
+sshd_effective_text: "{{ sshd_current_effective.stdout }}"
+sshd_expected_ports: "{{ sshd_final_ports }}"
+# TCP ports on which the sshd daemon listens, and every listening TCP port,
+# from ss -Hltnp.
+sshd_listeners_sshd: >-
+  {{ sshd_listen_text | regex_findall(sshd_listen_sshd_re)
+     | map('int') | unique | sort }}
+sshd_listeners_all: >-
+  {{ sshd_listen_text | regex_findall(sshd_listen_re)
+     | map('int') | unique | sort }}
+
+# Regular expressions, kept here so that Jinja does not process backslashes.
+sshd_listen_re: '(?m)^\S+\s+\d+\s+\d+\s+\S*:(\d+)\s+\S+'
+sshd_listen_sshd_re: '{{ sshd_listen_re }}\s+users:\(\("sshd",'
+# Every value of every port and allowusers line, so that repeated lines and
+# several values on one line are all compared.
+sshd_port_re: '(?m)^port (.*)$'
+sshd_allowusers_re: '(?m)^allowusers (.*)$'
+sshd_unit_property_re: '(?m)^([A-Za-z]+)=(.*)$'
+sshd_exec_start_re: "^\\{ path=/usr/sbin/sshd ; \
+  argv\\[\\]=/usr/sbin/sshd -D \\$SSHD_OPTS ;"
+sshd_default_opts_empty_re: '^\s*(export\s+)?SSHD_OPTS\s*=\s*(""|'''')?\s*$'
+sshd_known_hosts_key_re: '(?m)^[^#@\s]\S*\s+(\S+\s+\S+)'
+
+# Mismatches between sshd -T output (sshd_effective_text) and the policy with
+# the listener ports sshd_expected_ports; empty when the policy holds.
+sshd_policy_errors: >-
+  {%- set errors = [] -%}
+  {%- set ports = sshd_effective_text | regex_findall(sshd_port_re)
+                  | map('split') | flatten | map('int') | sort -%}
+  {%- if ports != sshd_expected_ports | map('int') | sort -%}
+  {%- set _ = errors.append('port ' ~ (ports | join(',') or 'unset')) -%}
+  {%- endif -%}
+  {%- set users = sshd_effective_text | regex_findall(sshd_allowusers_re)
+                  | map('split') | flatten | list -%}
+  {%- if users != ['root'] -%}
+  {%- set _ = errors.append('allowusers ' ~ (users | join(',') or 'unset')) -%}
+  {%- endif -%}
+  {%- for key, allowed in sshd_policy.items() -%}
+  {%- set found = sshd_effective_text
+                  | regex_findall('(?m)^' ~ key ~ ' (.*)$') -%}
+  {%- if found | length != 1 or found[0] not in allowed -%}
+  {%- set _ = errors.append(key ~ ' ' ~ (found | join(',') or 'unset')) -%}
+  {%- endif -%}
+  {%- endfor -%}
+  {%- if sshd_effective_text
+         is search('(?m)^pubkeyacceptedalgorithms .*-cert-v01@') -%}
+  {%- set _ = errors.append('pubkeyacceptedalgorithms has certificates') -%}
+  {%- endif -%}
+  {%- if sshd_effective_text is not search('(?m)^subsystem sftp [^ ]') -%}
+  {%- set _ = errors.append('subsystem sftp unset') -%}
+  {%- endif -%}
+  {{ errors | join('; ') }}
+
+sshd_stage_names:
+  arming: >-
+    the recovery state, token or timer of this operation was being
+    created; the live drop-in was not changed
+  armed: >-
+    the rollback timer was armed; the candidate with ports
+    {{ sshd_stage_ports | join(' and ') }} was being validated; the live
+    drop-in was not changed
+  stage-promoted: >-
+    the drop-in with ports {{ sshd_stage_ports | join(' and ') }} was
+    promoted and sshd reloaded; port {{ sshd_port }} was being proved or
+    the final state verified
+  final-validated: >-
+    port {{ sshd_port }} was proved; the final candidate was being validated
+    or promoted, and the promotion did not complete, so port
+    {{ sshd_current_port }} was still open
+  final-promoted: >-
+    sshd runs the final drop-in; the proofs and the final verification over
+    port {{ sshd_port }} had not completed

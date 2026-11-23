@@ -1,0 +1,30 @@
+# Managed by Ansible (role sshd); local changes are overwritten.
+# Read before every other file: for these keywords sshd keeps the first
+# value it reads. Port lines accumulate across files.
+{% for port in sshd_render_ports %}
+Port {{ port }}
+{% endfor %}
+
+# Only root, only with a plain public key from /root/.ssh/authorized_keys.
+AllowUsers root
+PermitRootLogin prohibit-password
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PubkeyAcceptedAlgorithms -*-cert-v01@openssh.com
+AuthorizedKeysFile /root/.ssh/authorized_keys
+AuthorizedKeysCommand none
+TrustedUserCAKeys none
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+
+# No forwarding or tunnels; shells, PTYs, commands and the packaged SFTP
+# subsystem stay available.
+DisableForwarding yes
+PermitTunnel no
+PermitTTY yes
+ForceCommand none
+ChrootDirectory none
+
+# Debian PAM account and session handling.
+UsePAM yes
