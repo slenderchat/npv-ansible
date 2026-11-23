@@ -1,0 +1,75 @@
+---
+# Key material and raw proof output never appear in task output: the
+# controller-side commands that carry them use no_log. The drop-in holds no
+# key material, so its diff is shown.
+
+# Read-only, also in check mode. Every blocker stops the host here, before
+# anything is written.
+- name: Inspect the SSH service, its configuration and the controller trust
+  ansible.builtin.include_tasks: inspect.yml
+
+# The drop-in text is current and the converged gate in inspect.yml has
+# passed. Only owner, group and mode may still differ; a change of them
+# alone needs no reload, because sshd reads the same text. The inspection
+# has already rejected any path type other than a regular file. In check
+# mode the module predicts the change and shows it with --diff.
+- name: Correct the owner and mode of the current drop-in
+  ansible.builtin.file:
+    path: "{{ sshd_dropin_path }}"
+    state: file
+    follow: false
+    owner: root
+    group: root
+    mode: "0644"
+  when: not sshd_change_needed
+
+- name: Show the final drop-in
+  ansible.builtin.copy:
+    content: "{{ sshd_final_text }}"
+    dest: "{{ sshd_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: ansible_check_mode and sshd_change_needed
+
+- name: Report the planned change and the checks deferred to a normal run
+  ansible.builtin.debug:
+    msg: >-
+      A normal run would: prove a fresh root login on port
+      {{ sshd_current_port }}; create the recovery state, token and timer
+      of a new operation ({{ sshd_rollback_delay }} s); validate the
+      candidate with
+      {{ 'ports ' ~ sshd_stage_ports | join(' and ')
+         if sshd_migrating else 'port ' ~ sshd_port }} in the composed
+      configuration with sshd -t -f and sshd -T -f, promote it and reload
+      {{ sshd_service }}; prove a root command and SFTP on port
+      {{ sshd_port }} from the controller;
+      {{ 'validate and promote the final candidate, which closes port '
+         ~ sshd_current_port ~ '; prove port ' ~ sshd_port ~ ' again; '
+         if sshd_migrating else '' }}verify the effective configuration and
+      the listeners over a fresh connection to port {{ sshd_port }}; cancel
+      the rollback{{ '; end this run for the host' if sshd_migrating
+      else '' }}. None of these runtime checks was performed now.
+  changed_when: true
+  when: ansible_check_mode and sshd_change_needed
+
+- name: Apply the SSH configuration
+  ansible.builtin.include_tasks: apply.yml
+  when: not ansible_check_mode and sshd_change_needed
+
+# Port sshd_current_port is closed now, and -e ansible_port overrides any
+# later change of the connection port, so no further task in this play may
+# connect to the host.
+- name: Report the end of the bootstrap run
+  ansible.builtin.debug:
+    msg: >-
+      SSH on {{ inventory_hostname }} now listens only on port
+      {{ sshd_port }}; port {{ sshd_current_port }} is closed. The remaining
+      tasks of this play are skipped for this host. Run the next invocation
+      without -e ansible_port, so that the inventory port {{ sshd_port }} is
+      used.
+  when: not ansible_check_mode and sshd_change_needed and sshd_migrating
+
+- name: End the play for this host after the port migration
+  ansible.builtin.meta: end_host
+  when: not ansible_check_mode and sshd_change_needed and sshd_migrating

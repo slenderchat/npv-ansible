@@ -1,0 +1,63 @@
+---
+# A new ssh (and optionally sftp) process on the controller, with only the
+# proof identity and the options in sshd_probe_options. It never uses an
+# existing master connection or Ansible's connection settings. Raw output
+# stays in the registered results.
+#
+# Input: sshd_probe_port, sshd_probe_purpose, sshd_probe_sftp (bool) and
+# optionally sshd_probe_command, whose output must end with the marker.
+
+- name: Run a root command over a fresh SSH connection
+  ansible.builtin.command:
+    argv: >-
+      {{ ['ssh'] + sshd_probe_options
+         + ['-T', '-n', '-p', sshd_probe_port | string, '--', sshd_probe_host,
+            sshd_probe_command | default('printf %s ' ~ sshd_probe_marker)] }}
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  no_log: true
+  timeout: 120
+  register: sshd_probe
+
+- name: Require the root command to succeed
+  ansible.builtin.assert:
+    that:
+      - sshd_probe.rc == 0
+      - sshd_probe.stdout.endswith(sshd_probe_marker)
+    fail_msg: >-
+      {{ sshd_probe_purpose }}: a root command over a fresh SSH connection to
+      {{ sshd_probe_host }} port {{ sshd_probe_port }} failed: ssh rc
+      {{ sshd_probe.rc }} (255: connection, host key or authentication
+      failure), success marker
+      {{ 'matched' if sshd_probe.stdout.endswith(sshd_probe_marker)
+         else 'not matched' }}.
+    quiet: true
+
+# sftp -b fails on the first failed command.
+- name: Open the SFTP subsystem over a fresh connection
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sftp', '-b', '-'] + sshd_probe_options
+         + ['-P', sshd_probe_port | string, '--', sshd_probe_host] }}
+    stdin: "{{ sshd_sftp_batch }}"
+    stdin_add_newline: false
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  no_log: true
+  timeout: 120
+  register: sshd_probe_sftp_result
+  when: sshd_probe_sftp
+
+- name: Require the SFTP request to succeed
+  ansible.builtin.assert:
+    that: sshd_probe_sftp_result.rc == 0
+    fail_msg: >-
+      {{ sshd_probe_purpose }}: a read-only SFTP request (ls /) over a fresh
+      connection to {{ sshd_probe_host }} port {{ sshd_probe_port }} failed:
+      sftp rc {{ sshd_probe_sftp_result.rc }}.
+    quiet: true
+  when: sshd_probe_sftp
