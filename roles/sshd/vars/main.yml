@@ -147,7 +147,12 @@ sshd_allowed_sockets:
 # fallback, ssh_config ignored, and strict host key checking against
 # ~/.ssh/known_hosts only, which is never updated.
 sshd_known_hosts_file: "{{ '~/.ssh/known_hosts' | expanduser }}"
-sshd_probe_host: "{{ ansible_host | default(inventory_hostname) }}"
+# The managed host's own address and port, read through hostvars: under
+# delegate_to: localhost, bare ansible_host and ansible_port would be those
+# of the controller. hostvars includes -e ansible_port=22.
+sshd_probe_host: >-
+  {{ hostvars[inventory_hostname].ansible_host
+     | default(inventory_hostname) }}
 sshd_probe_marker: npv-sshd-proof
 sshd_probe_options:
   - -F
@@ -190,7 +195,7 @@ sshd_probe_options:
 sshd_sftp_batch: "ls /\n"
 
 # Derived values, templated lazily after the inspection.
-sshd_current_port: "{{ ansible_port | int }}"
+sshd_current_port: "{{ hostvars[inventory_hostname].ansible_port | int }}"
 sshd_migrating: "{{ sshd_current_port | int != sshd_port }}"
 sshd_unit: >-
   {{ dict(sshd_unit_show.stdout | regex_findall(sshd_unit_property_re)) }}
