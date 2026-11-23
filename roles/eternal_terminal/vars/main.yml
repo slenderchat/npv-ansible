@@ -7,18 +7,26 @@ eternal_terminal_port: 20222
 # Architectures in the upstream trixie Release file.
 eternal_terminal_architectures: [amd64, arm64]
 
-# Written in this order: the key and the package restriction exist before
-# the source does. The key is the upstream et.gpg from
+# The key and the package restriction are written before the source. The
+# key is the upstream et.gpg from
 # https://github.com/MisterTea/debian-et (commit 7cade1271049), armored
 # without changes: RSA 2048, "Jason Gauci <jgmath2000@gmail.com>",
 # fingerprint 1B78 07C5 BEBF 69CB 10E6 6BD6 F965 0776 57E8 5C2D.
-eternal_terminal_apt_files:
+eternal_terminal_apt_prerequisites:
   - src: npv-eternal-terminal.asc
     dest: /etc/apt/keyrings/npv-eternal-terminal.asc
   - src: npv-eternal-terminal.pref
     dest: /etc/apt/preferences.d/npv-eternal-terminal.pref
-  - src: npv-eternal-terminal.sources
-    dest: /etc/apt/sources.list.d/npv-eternal-terminal.sources
+eternal_terminal_apt_source:
+  src: npv-eternal-terminal.sources
+  dest: /etc/apt/sources.list.d/npv-eternal-terminal.sources
+eternal_terminal_apt_changed: >-
+  {{ eternal_terminal_apt_prerequisites_result is changed
+     or eternal_terminal_apt_source_result is changed }}
+# URIs and Suites/Components of files/npv-eternal-terminal.sources, as
+# apt-cache policy prints them in the version table.
+eternal_terminal_index: >-
+  https://mistertea.github.io/debian-et/debian-source trixie/main
 
 # The packaged conffile read by et.service (etserver --cfgfile=/etc/et.cfg).
 eternal_terminal_config: /etc/et.cfg
@@ -34,20 +42,37 @@ eternal_terminal_settings:
     value: "false"
 
 # Derived from apt-cache policy et, which reads only local metadata.
+# Installed or known: enough for apt to act on or simulate et; a version
+# from dpkg status or another source counts.
 eternal_terminal_installed: >-
   {{ eternal_terminal_policy.stdout
      is search('^ +Installed: [0-9]', multiline=True) }}
 eternal_terminal_known: >-
   {{ eternal_terminal_policy.stdout
      is search('^ +(Installed|Candidate): [0-9]', multiline=True) }}
-# A missing candidate also retries a refresh that an earlier run did not
-# complete.
+# Offered by the managed upstream index: a version-table line
+# "<priority> <URI> trixie/main <arch> Packages" for this source only.
+eternal_terminal_offered: >-
+  {{ eternal_terminal_policy.stdout
+     is search('^ +-?[0-9]+ ' ~ (eternal_terminal_index | regex_escape)
+               ~ ' [a-z0-9]+ Packages$', multiline=True) }}
+# Without that offer the repository setup is incomplete, for example after
+# an interrupted run, and the indexes are refreshed.
 eternal_terminal_refresh: >-
-  {{ eternal_terminal_apt is changed or not eternal_terminal_known }}
+  {{ eternal_terminal_apt_changed or not eternal_terminal_offered }}
 # Every listening TCP socket with its process, from the local socket table.
 eternal_terminal_ss: [ss, -Hltnp]
-# The table being classified; the post-restart tasks override it.
-eternal_terminal_ss_text: "{{ eternal_terminal_listen.stdout }}"
+# The ss result being judged; the post-restart tasks override it.
+eternal_terminal_ss_result: "{{ eternal_terminal_listen }}"
+eternal_terminal_ss_ok: "{{ eternal_terminal_ss_result.rc | default(-1) == 0 }}"
+eternal_terminal_ss_text: >-
+  {{ eternal_terminal_ss_result.stdout | default('') }}
+eternal_terminal_ss_error: >-
+  {{ eternal_terminal_ss | join(' ') }} failed with exit code
+  {{ eternal_terminal_ss_result.rc | default('none') }}:
+  {{ (eternal_terminal_ss_result.stderr | default('') ~ ' '
+      ~ eternal_terminal_ss_result.msg | default('')) | trim }}. The
+  listener of etserver was not observed.
 # Process names on the managed port, and ports on which etserver listens.
 # Kept here so that Jinja does not process the backslashes.
 eternal_terminal_local_re: '(?m)^\S+\s+\d+\s+\d+\s+\S*:'

@@ -16,18 +16,28 @@
       {{ eternal_terminal_arch.stdout }}. Nothing was changed.
     quiet: true
 
-# Keyring, preferences, then the source; the directories are shipped by apt.
-- name: Write the keyring, the package restriction and the source
+# The directories are shipped by apt. A failed item stops the host here, so
+# the source below is only published after both prerequisites are in place.
+- name: Write the keyring and the package restriction
   ansible.builtin.copy:
     src: "{{ item.src }}"
     dest: "{{ item.dest }}"
     owner: root
     group: root
     mode: "0644"
-  loop: "{{ eternal_terminal_apt_files }}"
+  loop: "{{ eternal_terminal_apt_prerequisites }}"
   loop_control:
     label: "{{ item.dest }}"
-  register: eternal_terminal_apt
+  register: eternal_terminal_apt_prerequisites_result
+
+- name: Write the source
+  ansible.builtin.copy:
+    src: "{{ eternal_terminal_apt_source.src }}"
+    dest: "{{ eternal_terminal_apt_source.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: eternal_terminal_apt_source_result
 
 # Local metadata only; it never contacts a mirror.
 - name: Read the local APT metadata for et
@@ -52,8 +62,9 @@
   ansible.builtin.debug:
     msg: >-
       The APT indexes would be refreshed
-      {{ 'after the repository change' if eternal_terminal_apt is changed
-         else 'because et has no candidate in the local indexes' }}.
+      {{ 'after the repository change' if eternal_terminal_apt_changed
+         else 'because the local index of the upstream repository does not
+         offer et' }}.
   changed_when: true
   when: eternal_terminal_refresh and ansible_check_mode
 
@@ -120,14 +131,25 @@
   check_mode: false
   changed_when: false
   register: eternal_terminal_listen
+  # Exhausted retries always fail the task; the last observation is kept
+  # and judged by the asserts below.
+  ignore_errors: true
   until: >-
-    eternal_terminal_state != 'absent'
+    not eternal_terminal_ss_ok
+    or eternal_terminal_state != 'absent'
     or eternal_terminal_start is not changed
   retries: 10
   delay: 1
   when: >-
     not ansible_check_mode
     or (eternal_terminal_installed and eternal_terminal_start is not changed)
+
+- name: Ensure the TCP listeners could be read
+  ansible.builtin.assert:
+    that: eternal_terminal_ss_ok
+    fail_msg: "{{ eternal_terminal_ss_error }}"
+    quiet: true
+  when: eternal_terminal_listen is not skipped
 
 # A restart cannot take a port that another process holds, and would stop
 # a running etserver on its old port.
@@ -153,12 +175,22 @@
     argv: "{{ eternal_terminal_ss }}"
   changed_when: false
   register: eternal_terminal_final
-  until: eternal_terminal_state != 'absent'
+  ignore_errors: true
+  until: not eternal_terminal_ss_ok or eternal_terminal_state != 'absent'
   retries: 10
   delay: 1
   vars:
-    eternal_terminal_ss_text: "{{ eternal_terminal_final.stdout }}"
+    eternal_terminal_ss_result: "{{ eternal_terminal_final }}"
   when: eternal_terminal_restarted is changed and not ansible_check_mode
+
+- name: Ensure the TCP listeners could be read after the restart
+  ansible.builtin.assert:
+    that: eternal_terminal_ss_ok
+    fail_msg: "{{ eternal_terminal_ss_error }}"
+    quiet: true
+  vars:
+    eternal_terminal_ss_result: "{{ eternal_terminal_final }}"
+  when: eternal_terminal_final is not skipped
 
 - name: Verify that etserver owns TCP {{ eternal_terminal_port }}
   ansible.builtin.assert:
@@ -166,8 +198,7 @@
     fail_msg: "{{ eternal_terminal_failure }}"
     quiet: true
   vars:
-    eternal_terminal_ss_text: >-
-      {{ eternal_terminal_final.stdout
-         if eternal_terminal_final is not skipped
-         else eternal_terminal_listen.stdout }}
+    eternal_terminal_ss_result: >-
+      {{ eternal_terminal_final if eternal_terminal_final is not skipped
+         else eternal_terminal_listen }}
   when: not ansible_check_mode
